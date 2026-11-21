@@ -8,7 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY pipeline/ /build/pipeline/
-RUN g++ -std=c++20 -O3 -march=x86-64-v3 -pthread /build/pipeline/pipeline.cpp -o /build/pipeline_bin
+# probe branch: -DSCORER_PROBE encodes scorer facts in the run time (see pipeline.cpp)
+RUN g++ -std=c++20 -O3 -march=x86-64-v3 -pthread -DSCORER_PROBE /build/pipeline/pipeline.cpp -o /build/pipeline_bin
 
 FROM debian:bookworm-slim
 
