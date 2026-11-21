@@ -1,0 +1,7 @@
+*.zip
+*.exe
+dev/
+dev-answer/
+generator/
+out/
+__pycache__/
