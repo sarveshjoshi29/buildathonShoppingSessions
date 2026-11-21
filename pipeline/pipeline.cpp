@@ -21,6 +21,7 @@ constexpr size_t TUNABLE_ARENA_SLACK_PCT = 150;               // per-thread huge
 constexpr uint32_t TUNABLE_DEDUP_PREFETCH_DIST = 16;         // dedup hash table: prefetch the home slot this many records ahead
 constexpr size_t TUNABLE_FORWARD_PCT = 50;                  // Stage 3b buffer reserve: share of records expected to move (measured ~40% on 20M)
 constexpr size_t TUNABLE_DISTINCT_ID_DIV = 16;              // Stage 3b id map sized for records/16 distinct ids (20M: ~16 records per id); grows if needed
+constexpr size_t TUNABLE_RESOLVE_PREFETCH_DIST = 16;        // Stage 3b batch resolve: prefetch the link-table slot this many distinct ids ahead
 constexpr size_t TUNABLE_RADIX_SORT_MIN = 128;               // per-user event sort: 4-pass 32-bit LSD radix sort from this size
 } // namespace
 // ============================================================================
@@ -782,14 +783,11 @@ int main(int argc, char** argv) {
                 append_shards_to_arena(fwd_ev, click_arenas[t], est_fwd_ev);
                 append_shards_to_arena(fwd_clk, click_arenas[t], est_fwd_clk);
 
-                PersonIdMap id_map;              // raw id -> slot in canon_of (this shard only)
-                std::vector<uint64_t> canon_of;  // canonical id of each distinct raw id
-                auto canonical = [&](uint64_t raw) -> uint64_t {
-                    bool inserted = false;
-                    uint32_t k = id_map.find_or_insert(raw, inserted);
-                    if (inserted) canon_of.push_back(dsu.resolve_id64(raw));
-                    return canon_of[k];
-                };
+                constexpr uint16_t kStay = 0xFFFF;  // dest_of value: id is canonical, record stays
+                PersonIdMap id_map;                 // raw id -> distinct-id index k (this shard only)
+                std::vector<uint32_t> rec_k;        // k of each record, in pass order
+                std::vector<uint64_t> canon_of;     // canonical id of distinct id k
+                std::vector<uint16_t> dest_of;      // person shard of canon_of[k], or kStay
 
                 while (true) {
                     size_t sh = next_shard.fetch_add(1, std::memory_order_relaxed);
@@ -800,20 +798,46 @@ int main(int argc, char** argv) {
                     }
                     if (n_recs == 0) continue;
                     id_map.reset(n_recs / TUNABLE_DISTINCT_ID_DIV + 16);
-                    canon_of.clear();
+                    if (rec_k.size() < n_recs) rec_k.resize(n_recs);
 
-                    // Compact each source vector in place: canonical records stay, the rest move.
+                    // Pass 1: number the distinct raw ids (the id map stays in L2).
+                    size_t ri = 0;
+                    bool inserted = false;
+                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
+                        for (const auto& rec : thread_person_ev_shards[rt][sh]) rec_k[ri++] = id_map.find_or_insert(rec.user_id, inserted);
+                    }
+                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
+                        for (const auto& rec : thread_person_click_shards[rt][sh]) rec_k[ri++] = id_map.find_or_insert(rec.user_id, inserted);
+                    }
+
+                    // Resolve every distinct id once. Link-table lookups miss cache, so prefetch
+                    // later ids' slots to keep several misses in flight.
+                    const auto& ids = id_map.persons;
+                    const size_t n_ids = ids.size();
+                    canon_of.resize(n_ids);
+                    dest_of.resize(n_ids);
+                    for (size_t j = 0; j < n_ids; ++j) {
+                        if (j + TUNABLE_RESOLVE_PREFETCH_DIST < n_ids) dsu.prefetch(hash_id64(ids[j + TUNABLE_RESOLVE_PREFETCH_DIST]));
+                        uint64_t raw = ids[j];
+                        uint64_t c = dsu.resolve(raw, hash_id64(raw));
+                        canon_of[j] = c;
+                        dest_of[j] = (c == raw) ? kStay : static_cast<uint16_t>(hash_id64(c) & SHARD_MASK);
+                    }
+
+                    // Pass 2: compact each source vector in place; canonical records stay, the rest move.
+                    ri = 0;
                     for (unsigned int rt = 0; rt < num_threads; ++rt) {
                         auto& v = thread_person_ev_shards[rt][sh];
                         size_t keep = 0;
                         for (size_t i = 0; i < v.size(); ++i) {
                             SurvivingEventRecord rec = v[i];
-                            uint64_t c = canonical(rec.user_id);
-                            if (c == rec.user_id) {
+                            uint32_t k = rec_k[ri++];
+                            uint16_t d = dest_of[k];
+                            if (d == kStay) {
                                 v[keep++] = rec;
                             } else {
-                                rec.user_id = c;
-                                fwd_ev[static_cast<size_t>(hash_id64(c) & SHARD_MASK)].push_back(rec);
+                                rec.user_id = canon_of[k];
+                                fwd_ev[d].push_back(rec);
                             }
                         }
                         v.resize(keep);
@@ -823,12 +847,13 @@ int main(int argc, char** argv) {
                         size_t keep = 0;
                         for (size_t i = 0; i < v.size(); ++i) {
                             ValidClickRecord rec = v[i];
-                            uint64_t c = canonical(rec.user_id);
-                            if (c == rec.user_id) {
+                            uint32_t k = rec_k[ri++];
+                            uint16_t d = dest_of[k];
+                            if (d == kStay) {
                                 v[keep++] = rec;
                             } else {
-                                rec.user_id = c;
-                                fwd_clk[static_cast<size_t>(hash_id64(c) & SHARD_MASK)].push_back(rec);
+                                rec.user_id = canon_of[k];
+                                fwd_clk[d].push_back(rec);
                             }
                         }
                         v.resize(keep);

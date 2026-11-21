@@ -358,6 +358,13 @@ public:
 
     uint64_t resolve_id64(uint64_t uid) const { return resolve(uid, hash_id64(uid)); }
 
+    // Start loading the home slot of an id with hash h, so a later resolve(uid, h) hits cache.
+    void prefetch(uint64_t h) const {
+        size_t r = static_cast<size_t>(h >> kRegionShift);
+        uint64_t cap = region_cap_[r];
+        if (cap != 0) __builtin_prefetch(table_ + region_off_[r] + home(h, cap));
+    }
+
 private:
     static constexpr size_t kRegions = size_t{1} << TUNABLE_DSU_REGION_BITS;
     static constexpr unsigned kRegionShift = 64 - TUNABLE_DSU_REGION_BITS;
