@@ -6,7 +6,6 @@
 #include <cstdint>
 
 namespace pipeline {
-constexpr size_t TUNABLE_MAX_PACKED_ID_CHARS = 9;      // 9 chars * 7 bits = 63 bits inside uint64_t
 constexpr unsigned TUNABLE_DSU_REGION_BITS = 6;        // 64 hash regions (top hash bits) for parallel build
 constexpr size_t TUNABLE_DSU_TABLE_LOAD_PCT = 70;      // resolve-table fill factor (non-canonical keys only)
 constexpr size_t TUNABLE_DSU_PARALLEL_BLOCK = 1 << 16; // elements per parallel work item
@@ -23,20 +22,17 @@ constexpr size_t TUNABLE_DSU_PARALLEL_BLOCK = 1 << 16; // elements per parallel 
 #include <thread>
 #include <vector>
 
-#ifdef __BMI2__
 #include <immintrin.h>
-#endif
 
 namespace pipeline {
 
 // Lossless 63-bit big-endian packing of 1..9 character 7-bit ASCII IDs into a uint64_t.
 // Preserves byte-wise lexicographic order and equality; empty -> 0.
-// BMI2 path loads 8 bytes (and byte 8) unconditionally: the input must be followed by
+// Loads 8 bytes (and byte 8) unconditionally: the input must be followed by
 // at least 8 readable bytes (CsvChunkReader buffers guarantee TUNABLE_READ_PAD_BYTES).
 inline uint64_t pack_id64(std::string_view sv) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(sv.data());
     const size_t n = sv.size();
-#ifdef __BMI2__
     uint64_t w;
     std::memcpy(&w, p, 8);
     w = __builtin_bswap64(w);                                   // char0 in the top byte
@@ -44,12 +40,6 @@ inline uint64_t pack_id64(std::string_view sv) {
     uint64_t r = _pext_u64(w & keep, 0x7F7F7F7F7F7F7F7FULL) << 7;
     uint64_t tail = (n >= 9) ? static_cast<uint64_t>(p[8] & 0x7Fu) : 0ULL;
     return r | tail;
-#else
-    uint64_t r = 0;
-    size_t m = std::min(n, TUNABLE_MAX_PACKED_ID_CHARS);
-    for (size_t i = 0; i < m; ++i) r |= static_cast<uint64_t>(p[i] & 0x7Fu) << (56 - 7 * i);
-    return r;
-#endif
 }
 
 // Fast 64-bit integer hash for PackedId64 (5 register instructions, zero memory reads)
@@ -64,29 +54,12 @@ inline uint64_t hash_id64(uint64_t id) {
 
 // Fast 64-bit word-at-a-time string hash (for fallback string maps)
 inline uint64_t mix64(uint64_t a, uint64_t b) {
-#if defined(__SIZEOF_INT128__)
     __uint128_t r = static_cast<__uint128_t>(a) * static_cast<__uint128_t>(b);
     return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
-#else
-    uint64_t x = a ^ b;
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return x;
-#endif
 }
 
 inline uint64_t mulhi64(uint64_t a, uint64_t b) {
-#if defined(__SIZEOF_INT128__)
     return static_cast<uint64_t>((static_cast<__uint128_t>(a) * b) >> 64);
-#else
-    uint64_t a_lo = a & 0xFFFFFFFFu, a_hi = a >> 32, b_lo = b & 0xFFFFFFFFu, b_hi = b >> 32;
-    uint64_t mid1 = a_hi * b_lo, mid2 = a_lo * b_hi;
-    uint64_t carry = ((a_lo * b_lo >> 32) + (mid1 & 0xFFFFFFFFu) + (mid2 & 0xFFFFFFFFu)) >> 32;
-    return a_hi * b_hi + (mid1 >> 32) + (mid2 >> 32) + carry;
-#endif
 }
 
 inline uint64_t hash_bytes(std::string_view sv) {
@@ -124,6 +97,15 @@ inline uint64_t hash_bytes(std::string_view sv) {
     return seed;
 }
 
+// Runs fn(t) for t in [0, n) on n threads and waits for all of them.
+template <typename F>
+inline void run_workers(unsigned int n, F&& fn) {
+    std::vector<std::thread> workers;
+    workers.reserve(n);
+    for (unsigned int t = 0; t < n; ++t) workers.emplace_back([&fn, t]() { fn(t); });
+    for (auto& w : workers) w.join();
+}
+
 // Runs f(task) for task in [0, ntasks) on up to nth threads (atomic work counter).
 template <typename F>
 inline void parallel_tasks(unsigned int nth, size_t ntasks, F&& f) {
@@ -134,18 +116,13 @@ inline void parallel_tasks(unsigned int nth, size_t ntasks, F&& f) {
         return;
     }
     std::atomic<size_t> next{0};
-    std::vector<std::thread> workers;
-    workers.reserve(nth);
-    for (unsigned int t = 0; t < nth; ++t) {
-        workers.emplace_back([&]() {
-            while (true) {
-                size_t i = next.fetch_add(1, std::memory_order_relaxed);
-                if (i >= ntasks) break;
-                f(i);
-            }
-        });
-    }
-    for (auto& w : workers) w.join();
+    run_workers(nth, [&](unsigned int) {
+        while (true) {
+            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= ntasks) break;
+            f(i);
+        }
+    });
 }
 
 // 16-byte slot: 4 per 64-byte cache line.
@@ -174,9 +151,6 @@ public:
     ~LinkResolver() { free_table(); }
     LinkResolver(const LinkResolver&) = delete;
     LinkResolver& operator=(const LinkResolver&) = delete;
-
-    size_t num_entries() const { return num_entries_; }
-    size_t table_bytes() const { return table_size_ * sizeof(FlatDsuSlot); }
 
     void build(const std::vector<std::vector<LinkPair>>& thread_links, unsigned int nth) {
         const size_t T = thread_links.size();
@@ -260,25 +234,40 @@ public:
             }
         });
 
-        // 4. Sequential union-find (union by size, path halving).
-        std::vector<int32_t> parent(N, -1);
+        // 4. Parallel lock-free union-find: a root is linked under the smaller of the two roots
+        //    by CAS (parent indices only decrease, so no cycles), and finds halve paths with CAS
+        //    (a node's ancestors stay its ancestors, so replacing its parent by its grandparent
+        //    is safe under concurrent links).
+        std::vector<uint32_t> parent(N);
+        parallel_tasks(nth, blocks(N), [&](size_t b) {
+            size_t lo = b * TUNABLE_DSU_PARALLEL_BLOCK, hi = std::min(N, lo + TUNABLE_DSU_PARALLEL_BLOCK);
+            for (size_t i = lo; i < hi; ++i) parent[i] = static_cast<uint32_t>(i);
+        });
         auto find = [&](uint32_t x) -> uint32_t {
-            while (parent[x] >= 0) {
-                int32_t p = parent[x];
-                if (parent[p] < 0) return static_cast<uint32_t>(p);
-                parent[x] = parent[p];
-                x = static_cast<uint32_t>(parent[p]);
+            while (true) {
+                std::atomic_ref<uint32_t> px(parent[x]);
+                uint32_t p = px.load(std::memory_order_relaxed);
+                if (p == x) return x;
+                uint32_t gp = std::atomic_ref<uint32_t>(parent[p]).load(std::memory_order_relaxed);
+                if (gp != p) px.compare_exchange_weak(p, gp, std::memory_order_relaxed);
+                x = gp;
             }
-            return x;
         };
-        for (size_t l = 0; l < L; ++l) {
-            uint32_t a = find(edge[2 * l]);
-            uint32_t b = find(edge[2 * l + 1]);
-            if (a == b) continue;
-            if (parent[a] > parent[b]) std::swap(a, b);
-            parent[a] += parent[b];
-            parent[b] = static_cast<int32_t>(a);
-        }
+        parallel_tasks(nth, blocks(L), [&](size_t blk) {
+            size_t lo = blk * TUNABLE_DSU_PARALLEL_BLOCK, hi = std::min(L, lo + TUNABLE_DSU_PARALLEL_BLOCK);
+            for (size_t l = lo; l < hi; ++l) {
+                uint32_t a = edge[2 * l];
+                uint32_t b = edge[2 * l + 1];
+                while (true) {
+                    a = find(a);
+                    b = find(b);
+                    if (a == b) break;
+                    if (a < b) std::swap(a, b);   // link the larger root under the smaller
+                    uint32_t expect = a;
+                    if (std::atomic_ref<uint32_t>(parent[a]).compare_exchange_strong(expect, b, std::memory_order_relaxed)) break;
+                }
+            }
+        });
         std::vector<uint32_t>().swap(edge);
 
         // 5. Parallel roots and component minimum ids.
@@ -287,8 +276,7 @@ public:
         parallel_tasks(nth, blocks(N), [&](size_t b) {
             size_t lo = b * TUNABLE_DSU_PARALLEL_BLOCK, hi = std::min(N, lo + TUNABLE_DSU_PARALLEL_BLOCK);
             for (size_t i = lo; i < hi; ++i) {
-                uint32_t x = static_cast<uint32_t>(i);
-                while (parent[x] >= 0) x = static_cast<uint32_t>(parent[x]);
+                uint32_t x = find(static_cast<uint32_t>(i));
                 root[i] = x;
                 std::atomic_ref<uint64_t> m(comp_min[x]);
                 uint64_t v = node_id[i];
@@ -297,7 +285,7 @@ public:
                 }
             }
         });
-        std::vector<int32_t>().swap(parent);
+        std::vector<uint32_t>().swap(parent);
 
         // 6. Size each region for its non-canonical nodes (node regions == table regions).
         std::array<size_t, kRegions> region_cnt{};
@@ -307,10 +295,8 @@ public:
             region_cnt[r] = c;
         });
         size_t total = 0;
-        num_entries_ = 0;
         for (size_t r = 0; r < kRegions; ++r) {
             size_t c = region_cnt[r];
-            num_entries_ += c;
             region_cap_[r] = (c == 0) ? 0 : (c * 100) / TUNABLE_DSU_TABLE_LOAD_PCT + 1;
             region_off_[r] = total;
             total += region_cap_[r];
@@ -318,7 +304,6 @@ public:
         free_table();
         if (total == 0) return;
         table_ = static_cast<FlatDsuSlot*>(::operator new(total * sizeof(FlatDsuSlot), std::align_val_t{64}));
-        table_size_ = total;
 
         // 7. Parallel per-region fill.
         parallel_tasks(nth, kRegions, [&](size_t r) {
@@ -356,8 +341,6 @@ public:
         }
     }
 
-    uint64_t resolve_id64(uint64_t uid) const { return resolve(uid, hash_id64(uid)); }
-
     // Start loading the home slot of an id with hash h, so a later resolve(uid, h) hits cache.
     void prefetch(uint64_t h) const {
         size_t r = static_cast<size_t>(h >> kRegionShift);
@@ -379,12 +362,9 @@ private:
             ::operator delete(table_, std::align_val_t{64});
             table_ = nullptr;
         }
-        table_size_ = 0;
     }
 
     FlatDsuSlot* table_ = nullptr;
-    size_t table_size_ = 0;
-    size_t num_entries_ = 0;
     std::array<uint64_t, kRegions> region_off_;
     std::array<uint64_t, kRegions> region_cap_;
 };

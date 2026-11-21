@@ -7,7 +7,6 @@
 
 namespace parquet {
 constexpr size_t TUNABLE_USER_ID_MAX_BYTES_PER_ROW = 13; // 4-byte length + up to 9-byte unpacked PackedId64
-constexpr size_t TUNABLE_TOP_CAT_AVG_BYTES_PER_ROW = 16;
 constexpr size_t TUNABLE_CAMPAIGN_ID_AVG_RESERVE = 10;
 } // namespace parquet
 // ============================================================================
@@ -129,9 +128,9 @@ inline std::vector<uint8_t> make_page_header(int32_t uncompressed_size, int32_t 
     return tw.buf;
 }
 
-// Compact 32-byte UserDailyRow (down from 64 bytes: stores 8-byte PackedId64 user_id directly in the row!)
+// One user_daily row (32 bytes); user_id stays packed until the writer unpacks it.
 struct UserDailyRow {
-    uint64_t user_id;      // 8B: PackedId64 (unpacked directly in CPU registers, zero external pointers!)
+    uint64_t user_id;      // 8B: PackedId64
     int64_t revenue_cents; // 8B
     int32_t day;           // 4B
     int32_t sessions;      // 4B

@@ -6,7 +6,7 @@
 
 namespace {
 constexpr size_t TUNABLE_READ_CHUNK_BYTES = 512 * 1024;     // pread() task size; a task ends on the first '\n' past its range
-constexpr size_t TUNABLE_NUM_SHARDS = 256;                   // Power of 2; WSL A/B: 256 = 1.50 s, 64 = 1.69 s, 512 = 1.79 s
+constexpr size_t TUNABLE_NUM_SHARDS = 256;                   // Power of 2, at most 256 (Stage 2 stores a shard index in one byte)
 constexpr unsigned int TUNABLE_DEFAULT_THREADS = 8;
 constexpr int64_t TUNABLE_SESSION_GAP_MS = 1800000LL;        // 30 minutes
 constexpr int64_t TUNABLE_CLICK_LOOKBACK_MS = 604800000LL;   // 7 days
@@ -16,15 +16,15 @@ constexpr size_t TUNABLE_MIN_HASH_CAP = 64;
 constexpr uint32_t TUNABLE_FAST_PRODUCT_MAX_ID = 100000;
 constexpr uint32_t TUNABLE_FAST_CAMPAIGN_MAX_ID = 10000;
 constexpr size_t TUNABLE_RESERVE_SLACK_PCT = 100;            // shard vector reserve = estimate * 1.0 + 64; less untouched slack = less kernel page zeroing (ShardWriter regrows on overflow)
-constexpr size_t TUNABLE_INSERTION_SORT_MAX = 32;            // per-user event sort: insertion sort up to this size
+constexpr size_t TUNABLE_RANK_SORT_MAX = 64;                 // per-user event sort: branch-free AVX2 rank sort up to this size, LSD radix above
 constexpr size_t TUNABLE_ARENA_SLACK_PCT = 150;               // per-thread huge-page arena = shard reserves * 1.5 (room to regrow)
 constexpr uint32_t TUNABLE_DEDUP_PREFETCH_DIST = 16;         // dedup hash table: prefetch the home slot this many records ahead
 constexpr size_t TUNABLE_FORWARD_PCT = 50;                  // Stage 3b buffer reserve: share of records expected to move (measured ~40% on 20M)
 constexpr size_t TUNABLE_DISTINCT_ID_DIV = 16;              // Stage 3b id map sized for records/16 distinct ids (20M: ~16 records per id); grows if needed
+constexpr size_t TUNABLE_EVENTS_PER_PERSON = 16;            // Stage 4 person map sized for events/16 persons (generator: ~30 events per person); grows if needed
 constexpr size_t TUNABLE_RESOLVE_PREFETCH_DIST = 16;        // Stage 3b batch resolve: prefetch the link-table slot this many distinct ids ahead
 constexpr size_t TUNABLE_SPAN_PREFETCH_DIST = 4;            // survivor spans: prefetch this many spans ahead (Stage 3b, Stage 4)
 constexpr size_t TUNABLE_SPAN_PREFETCH_BYTES = 512;          // survivor spans: bytes prefetched from the start of a span
-constexpr size_t TUNABLE_RADIX_SORT_MIN = 128;               // per-user event sort: 4-pass 32-bit LSD radix sort from this size
 } // namespace
 // ============================================================================
 
@@ -41,6 +41,11 @@ constexpr size_t TUNABLE_RADIX_SORT_MIN = 128;               // per-user event s
 #include <string_view>
 #include <thread>
 #include <vector>
+
+// Built only for the scorer target (Dockerfile: -march=x86-64-v3 on Linux); no portable fallbacks.
+#if !defined(__AVX2__) || !defined(__BMI2__) || !defined(__SIZEOF_INT128__) || !defined(__linux__)
+#error "pipeline needs x86-64-v3 (AVX2, BMI2) and Linux"
+#endif
 
 #include "arena.hpp"
 #include "dsu.hpp"
@@ -272,26 +277,14 @@ using RawEventShard = std::vector<RawEventRecord, ArenaAllocator<RawEventRecord>
 using SurvivingEventShard = std::vector<SurvivingEventRecord, ArenaAllocator<SurvivingEventRecord>>;
 using ValidClickShard = std::vector<ValidClickRecord, ArenaAllocator<ValidClickRecord>>;
 
-// Like reserve_shards_in_arena, but carves after the blocks the arena already handed out
-// (no reset). Used to put later buffers into memory that is already faulted in.
+// Gives shard vector i `per_shard` reserved elements carved from arenas[i * stride]
+// (stride 0: all from one arena). Regrowth stays in that arena while it has room, then
+// falls back to the heap.
 template <typename Shard>
-void append_shards_to_arena(std::vector<Shard>& shards, HugeArena& arena, size_t per_shard) {
-    using T = typename Shard::value_type;
-    for (auto& s : shards) {
-        s = Shard(ArenaAllocator<T>(&arena));
-        s.reserve(per_shard);
-    }
-}
-
-// Gives each of a worker's shard vectors `per_shard` reserved elements carved from one
-// per-thread huge-page arena (one page fault per 2 MiB instead of per 4 KiB).
-// Gives shard vector i `per_shard` reserved elements carved from tails[i] (vector and its
-// regrowth stay in that arena while it has room, then fall back to the heap).
-template <typename Shard>
-void reserve_shards_in_tails(std::vector<Shard>& shards, HugeArena* tails, size_t per_shard) {
+void reserve_shards(std::vector<Shard>& shards, HugeArena* arenas, size_t stride, size_t per_shard) {
     using T = typename Shard::value_type;
     for (size_t i = 0; i < shards.size(); ++i) {
-        shards[i] = Shard(ArenaAllocator<T>(&tails[i]));
+        shards[i] = Shard(ArenaAllocator<T>(&arenas[i * stride]));
         shards[i].reserve(per_shard);
     }
 }
@@ -310,17 +303,10 @@ inline void prefetch_span(const SurvSpan& sp) {
     for (size_t off = 0; off < bytes && off < TUNABLE_SPAN_PREFETCH_BYTES; off += 64) __builtin_prefetch(c + off);
 }
 
-template <typename Shard>
-void reserve_shards_in_arena(std::vector<Shard>& shards, HugeArena& arena, size_t per_shard) {
-    using T = typename Shard::value_type;
-    arena.prepare(shards.size() * per_shard * sizeof(T) * TUNABLE_ARENA_SLACK_PCT / 100);
-    append_shards_to_arena(shards, arena, per_shard);
-}
-
 // Appends records to one worker's shard vectors through raw pointers kept on the stack, so a
 // push touches no vector header (push_back reloads and stores size per record). On open each
 // vector is resized to its capacity (the arena allocator default-initializes: nothing is
-// written); close() trims it to the records actually written.
+// written); the destructor trims it to the records actually written.
 template <typename Shard>
 class ShardWriter {
 public:
@@ -328,18 +314,15 @@ public:
     explicit ShardWriter(std::vector<Shard>& shards) : shards_(shards) {
         for (size_t i = 0; i < TUNABLE_NUM_SHARDS; ++i) open(i);
     }
-    ~ShardWriter() { close(); }
+    ~ShardWriter() {
+        for (size_t i = 0; i < TUNABLE_NUM_SHARDS; ++i) shards_[i].resize(static_cast<size_t>(cur_[i] - shards_[i].data()));
+    }
     ShardWriter(const ShardWriter&) = delete;
     ShardWriter& operator=(const ShardWriter&) = delete;
 
     void push(size_t i, const T& rec) {
         if (cur_[i] == lim_[i]) [[unlikely]] grow(i);
         *cur_[i]++ = rec;
-    }
-    void close() {
-        if (closed_) return;
-        for (size_t i = 0; i < TUNABLE_NUM_SHARDS; ++i) shards_[i].resize(static_cast<size_t>(cur_[i] - shards_[i].data()));
-        closed_ = true;
     }
 
 private:
@@ -358,19 +341,11 @@ private:
     std::vector<Shard>& shards_;
     T* cur_[TUNABLE_NUM_SHARDS];
     T* lim_[TUNABLE_NUM_SHARDS];
-    bool closed_ = false;
-};
-
-struct CampaignAgg {
-    int64_t sessions = 0;
-    int64_t purchasing_sessions = 0;
-    int64_t revenue_cents = 0;
-    int64_t assisted_sessions = 0;
 };
 
 // One worker's cell of the campaign x day grid (24 bytes instead of 32: the grid is updated at
 // random per session, so its size decides how much of it stays in L2). Counts within one worker
-// fit 32 bits (at most one per session); the merge adds them into CampaignAgg's 64-bit fields.
+// fit 32 bits (at most one per session); Stage 5 adds them into 64-bit row fields.
 struct CampaignCell {
     int64_t revenue_cents = 0;
     uint32_t sessions = 0;
@@ -410,27 +385,36 @@ inline bool sv_eq8(std::string_view sv, const char (&lit)[9]) {
     return a == b;
 }
 
-// Ascending sort of packed (rel_ts << 32 | meta) event words by upper 32-bit rel_ts.
-// Small: 2-elem / insertion sort. Large: 4-pass 8-bit LSD radix sort over rel_ts bytes (skips constant bytes).
+// Ascending sort of packed (rel_ts << 32 | meta) event words.
+// Small (most persons: ~30 events): branch-free AVX2 rank sort. Element i goes to position
+// #{j : a[j] < a[i]} + #{j < i : a[j] == a[i]}; all n * n compares run 4 lanes at a time with no
+// data-dependent branch (insertion sort mispredicts at the end of every inner loop).
+// Large: 4-pass 8-bit LSD radix sort over the rel_ts bytes (skips constant bytes).
 void sort_events_u64(uint64_t* a, size_t n, std::vector<uint64_t>& scratch) {
-    if (n == 2) {
-        if (a[0] > a[1]) std::swap(a[0], a[1]);
-        return;
-    }
-    if (n <= TUNABLE_INSERTION_SORT_MAX) {
-        for (size_t i = 1; i < n; ++i) {
-            uint64_t v = a[i];
-            size_t j = i;
-            while (j > 0 && a[j - 1] > v) {
-                a[j] = a[j - 1];
-                --j;
+    if (n <= TUNABLE_RANK_SORT_MAX) {
+        constexpr uint64_t kSign = 1ULL << 63;   // flipped sign bit: unsigned order via signed compares
+        alignas(32) int64_t buf[TUNABLE_RANK_SORT_MAX + 4];
+        const size_t nv = (n + 3) & ~size_t{3};
+        for (size_t k = 0; k < n; ++k) buf[k] = static_cast<int64_t>(a[k] ^ kSign);
+        for (size_t k = n; k < nv; ++k) buf[k] = std::numeric_limits<int64_t>::max();   // = UINT64_MAX: never below a key
+        const __m256i lane0 = _mm256_setr_epi64x(0, 1, 2, 3);
+        const __m256i four = _mm256_set1_epi64x(4);
+        for (size_t i = 0; i < n; ++i) {
+            const __m256i vi = _mm256_set1_epi64x(buf[i]);
+            const __m256i ii = _mm256_set1_epi64x(static_cast<int64_t>(i));
+            __m256i jj = lane0;
+            __m256i cnt = _mm256_setzero_si256();
+            for (size_t j = 0; j < nv; j += 4) {
+                const __m256i vj = _mm256_load_si256(reinterpret_cast<const __m256i*>(buf + j));
+                const __m256i lt = _mm256_cmpgt_epi64(vi, vj);
+                const __m256i eq_before = _mm256_and_si256(_mm256_cmpeq_epi64(vi, vj), _mm256_cmpgt_epi64(ii, jj));
+                cnt = _mm256_sub_epi64(cnt, _mm256_or_si256(lt, eq_before));
+                jj = _mm256_add_epi64(jj, four);
             }
-            a[j] = v;
+            const __m128i s2 = _mm_add_epi64(_mm256_castsi256_si128(cnt), _mm256_extracti128_si256(cnt, 1));
+            const size_t r = static_cast<size_t>(_mm_cvtsi128_si64(s2) + _mm_extract_epi64(s2, 1));
+            a[r] = static_cast<uint64_t>(buf[i]) ^ kSign;
         }
-        return;
-    }
-    if (n < TUNABLE_RADIX_SORT_MIN) {
-        std::sort(a, a + n);
         return;
     }
     uint32_t hist[4][256] = {};
@@ -591,24 +575,19 @@ int main(int argc, char** argv) {
         unsigned int l_threads = std::min<unsigned int>(num_threads, std::max<size_t>(1, link_files.tasks.size()));
         std::vector<std::vector<LinkPair>> thread_links(l_threads);
         std::atomic<size_t> next_chunk{0};
-        std::vector<std::thread> workers;
-        workers.reserve(l_threads);
-        for (unsigned int t = 0; t < l_threads; ++t) {
-            workers.emplace_back([&, t]() {
-                auto& out_l = thread_links[t];
-                CsvChunkReader reader;
-                while (true) {
-                    size_t c_idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                    if (c_idx >= link_files.tasks.size()) break;
-                    for_each_csv_record_in_slice<2>(reader.read(link_files, c_idx), [&](const std::array<std::string_view, 2>& f) {
-                        if (!f[0].empty() && !f[1].empty()) {
-                            out_l.push_back(LinkPair{pack_id64(f[0]), pack_id64(f[1])});
-                        }
-                    });
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
+        run_workers(l_threads, [&](unsigned int t) {
+            auto& out_l = thread_links[t];
+            CsvChunkReader reader;
+            while (true) {
+                size_t c_idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                if (c_idx >= link_files.tasks.size()) break;
+                for_each_csv_record_in_slice<2>(reader.read(link_files, c_idx), [&](const std::array<std::string_view, 2>& f) {
+                    if (!f[0].empty() && !f[1].empty()) {
+                        out_l.push_back(LinkPair{pack_id64(f[0]), pack_id64(f[1])});
+                    }
+                });
+            }
+        });
         dsu.build(thread_links, num_threads);
     }
 
@@ -623,74 +602,72 @@ int main(int argc, char** argv) {
     std::unique_ptr<HugeArena[]> ev_arenas(new HugeArena[num_threads]);
     {
         std::atomic<size_t> next_chunk{0};
-        std::vector<std::thread> workers;
-        workers.reserve(num_threads);
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            workers.emplace_back([&, t]() {
-                auto& my_shards = thread_ev_shards[t];
-                reserve_shards_in_arena(my_shards, ev_arenas[t], est_recs_per_thread_shard);
-                ShardWriter<RawEventShard> out(my_shards);
-                CsvChunkReader reader;
+        run_workers(num_threads, [&](unsigned int t) {
+            auto& my_shards = thread_ev_shards[t];
+            // One huge-page arena per worker: one page fault per 2 MiB instead of per 4 KiB.
+            ev_arenas[t].prepare(TUNABLE_NUM_SHARDS * est_recs_per_thread_shard * sizeof(RawEventRecord) *
+                                 TUNABLE_ARENA_SLACK_PCT / 100);
+            reserve_shards(my_shards, &ev_arenas[t], 0, est_recs_per_thread_shard);
+            ShardWriter<RawEventShard> out(my_shards);
+            CsvChunkReader reader;
 
-                while (true) {
-                    size_t c_idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                    if (c_idx >= event_files.tasks.size()) break;
-                    for_each_csv_record_in_slice<7>(reader.read(event_files, c_idx), [&](const std::array<std::string_view, 7>& f) {
-                        if (f[0].empty()) return;
+            while (true) {
+                size_t c_idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                if (c_idx >= event_files.tasks.size()) break;
+                for_each_csv_record_in_slice<7>(reader.read(event_files, c_idx), [&](const std::array<std::string_view, 7>& f) {
+                    if (f[0].empty()) return;
 
-                        int64_t ingest_ts = 0;
-                        if (!parse_timestamp_f1(f[3], ingest_ts)) return;
+                    int64_t ingest_ts = 0;
+                    if (!parse_timestamp_f1(f[3], ingest_ts)) return;
 
-                        bool valid = !f[1].empty() && !f[5].empty();
-                        int64_t ts = 0;
-                        int32_t price = 0;
-                        uint16_t cat_idx = 0;
+                    bool valid = !f[1].empty() && !f[5].empty();
+                    int64_t ts = 0;
+                    int32_t price = 0;
+                    uint16_t cat_idx = 0;
 
-                        if (valid) {
-                            if (!parse_timestamp(f[2], ts) || ts < window_start || ts >= window_end || (ingest_ts - ts > TUNABLE_DAY_MS)) {
-                                valid = false;
-                            }
+                    if (valid) {
+                        if (!parse_timestamp(f[2], ts) || ts < window_start || ts >= window_end || (ingest_ts - ts > TUNABLE_DAY_MS)) {
+                            valid = false;
                         }
-                        if (valid) {
-                            std::string_view etype = f[4];
-                            if (sv_eq4(etype, "view") || sv_eq4(etype, "cart")) {
-                                price = 0;
-                            } else if (sv_eq8(etype, "purchase")) {
-                                if (!parse_price_cents(f[6], price)) {
-                                    valid = false;
-                                } else {
-                                    cat_idx = lookup_product_cat(f[5]);
-                                }
+                    }
+                    if (valid) {
+                        std::string_view etype = f[4];
+                        if (sv_eq4(etype, "view") || sv_eq4(etype, "cart")) {
+                            price = 0;
+                        } else if (sv_eq8(etype, "purchase")) {
+                            if (!parse_price_cents(f[6], price)) {
+                                valid = false;
                             } else {
-                                valid = false;
+                                cat_idx = lookup_product_cat(f[5]);
                             }
+                        } else {
+                            valid = false;
                         }
+                    }
 
-                        // Raw id only; Stage 2 resolves survivors to their person in prefetched batches.
-                        uint64_t raw_user_id = valid ? pack_id64(f[1]) : 0;
+                    // Raw id only; Stage 2 resolves survivors to their person in prefetched batches.
+                    uint64_t raw_user_id = valid ? pack_id64(f[1]) : 0;
 
-                        uint64_t ev_id = pack_id64(f[0]);
-                        uint64_t ev_hash = hash_id64(ev_id);
-                        size_t shard_id = static_cast<size_t>(ev_hash & SHARD_MASK);
-                        int32_t ingest_rel_sec = static_cast<int32_t>((ingest_ts - window_start) / 1000LL);
-                        uint32_t rel_ts = valid ? static_cast<uint32_t>(ts - window_start) : 0u;
-                        uint32_t packed_meta = (valid ? 0x80000000u : 0u) |
-                                               (static_cast<uint32_t>(cat_idx & 0x7Fu) << 24) |
-                                               static_cast<uint32_t>(price & 0xFFFFFFu);
+                    uint64_t ev_id = pack_id64(f[0]);
+                    uint64_t ev_hash = hash_id64(ev_id);
+                    size_t shard_id = static_cast<size_t>(ev_hash & SHARD_MASK);
+                    int32_t ingest_rel_sec = static_cast<int32_t>((ingest_ts - window_start) / 1000LL);
+                    uint32_t rel_ts = valid ? static_cast<uint32_t>(ts - window_start) : 0u;
+                    uint32_t packed_meta = (valid ? 0x80000000u : 0u) |
+                                           (static_cast<uint32_t>(cat_idx & 0x7Fu) << 24) |
+                                           static_cast<uint32_t>(price & 0xFFFFFFu);
 
-                        out.push(shard_id, RawEventRecord{
-                            ev_id,
-                            raw_user_id,
-                            ingest_rel_sec,
-                            rel_ts,
-                            packed_meta,
-                            static_cast<uint32_t>(ev_hash >> 8)
-                        });
+                    out.push(shard_id, RawEventRecord{
+                        ev_id,
+                        raw_user_id,
+                        ingest_rel_sec,
+                        rel_ts,
+                        packed_meta,
+                        static_cast<uint32_t>(ev_hash >> 8)
                     });
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
+                });
+            }
+        });
     }
 
     // Stage 2: Parallel Deduplication
@@ -705,111 +682,106 @@ int main(int argc, char** argv) {
     std::vector<size_t> block_surv_bytes(num_blocks, 0);
     {
         std::atomic<size_t> next_shard{0};
-        std::vector<std::thread> workers;
-        workers.reserve(num_threads);
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            workers.emplace_back([&, t]() {
-                std::vector<SurvivingEventRecord> part_recs;   // one block's survivors, before grouping
-                std::vector<uint8_t> part_dest;                // their person shards
+        run_workers(num_threads, [&](unsigned int t) {
+            std::vector<SurvivingEventRecord> part_recs;   // one block's survivors, before grouping
+            std::vector<uint8_t> part_dest;                // their person shards
 
-                // Packed 8-byte slot: bit 63 = occupied (1), bits 32..62 = 31-bit event_id tag,
-                // bits 24..31 = thread_idx, bits 0..23 = rec_idx. Empty slot = 0ULL.
-                std::vector<uint64_t> table;
+            // Packed 8-byte slot: bit 63 = occupied (1), bits 32..62 = 31-bit event_id tag,
+            // bits 24..31 = thread_idx, bits 0..23 = rec_idx. Empty slot = 0ULL.
+            std::vector<uint64_t> table;
 
-                while (true) {
-                    size_t s_id = next_shard.fetch_add(1, std::memory_order_relaxed);
-                    if (s_id >= TUNABLE_NUM_SHARDS) break;
+            while (true) {
+                size_t s_id = next_shard.fetch_add(1, std::memory_order_relaxed);
+                if (s_id >= TUNABLE_NUM_SHARDS) break;
 
-                    size_t total_recs = 0;
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        total_recs += thread_ev_shards[rt][s_id].size();
-                    }
-                    if (total_recs == 0) continue;
+                size_t total_recs = 0;
+                for (unsigned int rt = 0; rt < num_threads; ++rt) {
+                    total_recs += thread_ev_shards[rt][s_id].size();
+                }
+                if (total_recs == 0) continue;
 
-                    size_t cap = TUNABLE_MIN_HASH_CAP;
-                    while (cap < total_recs * 2) cap <<= 1;
-                    table.assign(cap, 0ULL);
-                    uint64_t mask = cap - 1;
+                size_t cap = TUNABLE_MIN_HASH_CAP;
+                while (cap < total_recs * 2) cap <<= 1;
+                table.assign(cap, 0ULL);
+                uint64_t mask = cap - 1;
 
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        auto& recs = thread_ev_shards[rt][s_id];
-                        const uint32_t n_recs = static_cast<uint32_t>(recs.size());
-                        for (uint32_t ri = 0; ri < n_recs; ++ri) {
-                            // The table is larger than L2: start loading a later record's home slot now.
-                            if (ri + TUNABLE_DEDUP_PREFETCH_DIST < n_recs) {
-                                __builtin_prefetch(&table[recs[ri + TUNABLE_DEDUP_PREFETCH_DIST].ev_hash_hi & mask], 1);
+                for (unsigned int rt = 0; rt < num_threads; ++rt) {
+                    auto& recs = thread_ev_shards[rt][s_id];
+                    const uint32_t n_recs = static_cast<uint32_t>(recs.size());
+                    for (uint32_t ri = 0; ri < n_recs; ++ri) {
+                        // The table is larger than L2: start loading a later record's home slot now.
+                        if (ri + TUNABLE_DEDUP_PREFETCH_DIST < n_recs) {
+                            __builtin_prefetch(&table[recs[ri + TUNABLE_DEDUP_PREFETCH_DIST].ev_hash_hi & mask], 1);
+                        }
+                        auto& rec = recs[ri];
+                        uint64_t eid = rec.event_id;
+                        uint64_t tag = (1ULL << 63) | (((eid ^ (eid >> 31)) & 0x7FFFFFFFULL) << 32);
+                        uint64_t pos = rec.ev_hash_hi & mask;
+                        while (true) {
+                            uint64_t sl = table[pos];
+                            if (sl == 0) {
+                                table[pos] = tag | (static_cast<uint64_t>(rt) << 24) | ri;
+                                break;
                             }
-                            auto& rec = recs[ri];
-                            uint64_t eid = rec.event_id;
-                            uint64_t tag = (1ULL << 63) | (((eid ^ (eid >> 31)) & 0x7FFFFFFFULL) << 32);
-                            uint64_t pos = rec.ev_hash_hi & mask;
-                            while (true) {
-                                uint64_t sl = table[pos];
-                                if (sl == 0) {
-                                    table[pos] = tag | (static_cast<uint64_t>(rt) << 24) | ri;
+                            if (((sl ^ tag) >> 32) == 0) {
+                                uint32_t ex_rt = static_cast<uint32_t>((sl >> 24) & 0xFFu);
+                                uint32_t ex_ri = static_cast<uint32_t>(sl & 0xFFFFFFu);
+                                auto& ex_rec = thread_ev_shards[ex_rt][s_id][ex_ri];
+                                if (ex_rec.event_id == eid) {
+                                    if (rec.ingest_rel_sec < ex_rec.ingest_rel_sec) {
+                                        ex_rec.price_cat_valid = 0;
+                                        table[pos] = tag | (static_cast<uint64_t>(rt) << 24) | ri;
+                                    } else {
+                                        rec.price_cat_valid = 0;
+                                    }
                                     break;
                                 }
-                                if (((sl ^ tag) >> 32) == 0) {
-                                    uint32_t ex_rt = static_cast<uint32_t>((sl >> 24) & 0xFFu);
-                                    uint32_t ex_ri = static_cast<uint32_t>(sl & 0xFFFFFFu);
-                                    auto& ex_rec = thread_ev_shards[ex_rt][s_id][ex_ri];
-                                    if (ex_rec.event_id == eid) {
-                                        if (rec.ingest_rel_sec < ex_rec.ingest_rel_sec) {
-                                            ex_rec.price_cat_valid = 0;
-                                            table[pos] = tag | (static_cast<uint64_t>(rt) << 24) | ri;
-                                        } else {
-                                            rec.price_cat_valid = 0;
-                                        }
-                                        break;
-                                    }
-                                }
-                                pos = (pos + 1) & mask;
                             }
+                            pos = (pos + 1) & mask;
                         }
-                    }
-
-                    // Survivors are grouped by the person shard of their RAW user id; Stage 3b
-                    // resolves each distinct id once and forwards the events of non-canonical ids.
-                    // Dedup of this event shard is complete, so each raw block is read once more
-                    // and then overwritten with its own grouped survivors.
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        auto& recs = thread_ev_shards[rt][s_id];
-                        const size_t n_recs = recs.size();
-                        if (part_recs.size() < n_recs) {
-                            part_recs.resize(n_recs);
-                            part_dest.resize(n_recs);
-                        }
-                        uint32_t cnt[TUNABLE_NUM_SHARDS] = {};
-                        size_t m = 0;
-                        for (size_t i = 0; i < n_recs; ++i) {
-                            const auto& rec = recs[i];
-                            if ((rec.price_cat_valid & 0x80000000u) == 0) continue;
-                            const uint8_t u_shard = static_cast<uint8_t>(hash_id64(rec.user_id) & SHARD_MASK);
-                            uint64_t packed_ev = (static_cast<uint64_t>(rec.rel_ts) << 32) |
-                                                 static_cast<uint64_t>(rec.price_cat_valid & 0x7FFFFFFFu);
-                            part_recs[m] = SurvivingEventRecord{rec.user_id, packed_ev};
-                            part_dest[m] = u_shard;
-                            ++cnt[u_shard];
-                            ++m;
-                        }
-                        const size_t b = static_cast<size_t>(rt) * TUNABLE_NUM_SHARDS + s_id;
-                        SurvivingEventRecord* base = reinterpret_cast<SurvivingEventRecord*>(recs.data());
-                        uint32_t pos[TUNABLE_NUM_SHARDS];
-                        uint32_t run = 0;
-                        for (size_t sh = 0; sh < TUNABLE_NUM_SHARDS; ++sh) {
-                            pos[sh] = run;
-                            surv_spans[sh * num_blocks + b] = SurvSpan{base + run, cnt[sh]};
-                            run += cnt[sh];
-                        }
-                        for (size_t i = 0; i < m; ++i) {
-                            std::memcpy(base + pos[part_dest[i]]++, &part_recs[i], sizeof(SurvivingEventRecord));
-                        }
-                        block_surv_bytes[b] = m * sizeof(SurvivingEventRecord);
                     }
                 }
-            });
-        }
-        for (auto& w : workers) w.join();
+
+                // Survivors are grouped by the person shard of their RAW user id; Stage 3b
+                // resolves each distinct id once and forwards the events of non-canonical ids.
+                // Dedup of this event shard is complete, so each raw block is read once more
+                // and then overwritten with its own grouped survivors.
+                for (unsigned int rt = 0; rt < num_threads; ++rt) {
+                    auto& recs = thread_ev_shards[rt][s_id];
+                    const size_t n_recs = recs.size();
+                    if (part_recs.size() < n_recs) {
+                        part_recs.resize(n_recs);
+                        part_dest.resize(n_recs);
+                    }
+                    uint32_t cnt[TUNABLE_NUM_SHARDS] = {};
+                    size_t m = 0;
+                    for (size_t i = 0; i < n_recs; ++i) {
+                        const auto& rec = recs[i];
+                        if ((rec.price_cat_valid & 0x80000000u) == 0) continue;
+                        const uint8_t u_shard = static_cast<uint8_t>(hash_id64(rec.user_id) & SHARD_MASK);
+                        uint64_t packed_ev = (static_cast<uint64_t>(rec.rel_ts) << 32) |
+                                             static_cast<uint64_t>(rec.price_cat_valid & 0x7FFFFFFFu);
+                        part_recs[m] = SurvivingEventRecord{rec.user_id, packed_ev};
+                        part_dest[m] = u_shard;
+                        ++cnt[u_shard];
+                        ++m;
+                    }
+                    const size_t b = static_cast<size_t>(rt) * TUNABLE_NUM_SHARDS + s_id;
+                    SurvivingEventRecord* base = reinterpret_cast<SurvivingEventRecord*>(recs.data());
+                    uint32_t pos[TUNABLE_NUM_SHARDS];
+                    uint32_t run = 0;
+                    for (size_t sh = 0; sh < TUNABLE_NUM_SHARDS; ++sh) {
+                        pos[sh] = run;
+                        surv_spans[sh * num_blocks + b] = SurvSpan{base + run, cnt[sh]};
+                        run += cnt[sh];
+                    }
+                    for (size_t i = 0; i < m; ++i) {
+                        std::memcpy(base + pos[part_dest[i]]++, &part_recs[i], sizeof(SurvivingEventRecord));
+                    }
+                    block_surv_bytes[b] = m * sizeof(SurvivingEventRecord);
+                }
+            }
+        });
     }
 
     // Stage 3: Clicks Ingest
@@ -835,40 +807,35 @@ int main(int argc, char** argv) {
     }
     {
         std::atomic<size_t> next_chunk{0};
-        std::vector<std::thread> workers;
-        workers.reserve(num_threads);
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            workers.emplace_back([&, t]() {
-                auto& my_out = thread_person_click_shards[t];
-                reserve_shards_in_tails(my_out, &tail_arenas[static_cast<size_t>(t) * TUNABLE_NUM_SHARDS], est_clicks_per_thread_shard);
-                ShardWriter<ValidClickShard> out(my_out);
-                CsvChunkReader reader;
+        run_workers(num_threads, [&](unsigned int t) {
+            auto& my_out = thread_person_click_shards[t];
+            reserve_shards(my_out, &tail_arenas[static_cast<size_t>(t) * TUNABLE_NUM_SHARDS], 1, est_clicks_per_thread_shard);
+            ShardWriter<ValidClickShard> out(my_out);
+            CsvChunkReader reader;
 
-                while (true) {
-                    size_t c_idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                    if (c_idx >= click_files.tasks.size()) break;
-                    for_each_csv_record_in_slice<4>(reader.read(click_files, c_idx), [&](const std::array<std::string_view, 4>& f) {
-                        if (f[0].empty() || f[1].empty() || f[2].empty()) return;
+            while (true) {
+                size_t c_idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                if (c_idx >= click_files.tasks.size()) break;
+                for_each_csv_record_in_slice<4>(reader.read(click_files, c_idx), [&](const std::array<std::string_view, 4>& f) {
+                    if (f[0].empty() || f[1].empty() || f[2].empty()) return;
 
-                        uint32_t camp_idx = lookup_campaign_idx(f[2]);
-                        if (camp_idx == 0xFFFFFFFFu) return;
+                    uint32_t camp_idx = lookup_campaign_idx(f[2]);
+                    if (camp_idx == 0xFFFFFFFFu) return;
 
-                        int64_t ts = 0;
-                        if (!parse_timestamp(f[3], ts) || ts < click_window_start || ts >= click_window_end) return;
+                    int64_t ts = 0;
+                    if (!parse_timestamp(f[3], ts) || ts < click_window_start || ts >= click_window_end) return;
 
-                        // Sharded by the RAW user id; Stage 3b resolves and forwards.
-                        uint64_t raw_user_id = pack_id64(f[1]);
-                        out.push(static_cast<size_t>(hash_id64(raw_user_id) & SHARD_MASK), ValidClickRecord{
-                            raw_user_id,
-                            pack_id64(f[0]),
-                            static_cast<uint32_t>(ts - click_window_start),
-                            camp_idx
-                        });
+                    // Sharded by the RAW user id; Stage 3b resolves and forwards.
+                    uint64_t raw_user_id = pack_id64(f[1]);
+                    out.push(static_cast<size_t>(hash_id64(raw_user_id) & SHARD_MASK), ValidClickRecord{
+                        raw_user_id,
+                        pack_id64(f[0]),
+                        static_cast<uint32_t>(ts - click_window_start),
+                        camp_idx
                     });
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
+                });
+            }
+        });
     }
 
     // Stage 3b: Resolve each distinct user id once and forward non-canonical records.
@@ -892,103 +859,98 @@ int main(int argc, char** argv) {
         const size_t est_fwd_clk = reserve_with_slack(total_clicks * TUNABLE_FORWARD_PCT / 100 / per_shard_div);
 
         std::atomic<size_t> next_shard{0};
-        std::vector<std::thread> workers;
-        workers.reserve(num_threads);
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            workers.emplace_back([&, t]() {
-                auto& fwd_ev = thread_fwd_ev_shards[t];
-                auto& fwd_clk = thread_fwd_click_shards[t];
-                // Forwarding buffers go after the click buffers in the raw blocks' free tails
-                // (already faulted in: no new page faults).
-                HugeArena* my_tails = &tail_arenas[static_cast<size_t>(t) * TUNABLE_NUM_SHARDS];
-                reserve_shards_in_tails(fwd_ev, my_tails, est_fwd_ev);
-                reserve_shards_in_tails(fwd_clk, my_tails, est_fwd_clk);
-                ShardWriter<SurvivingEventShard> fwd_ev_out(fwd_ev);
-                ShardWriter<ValidClickShard> fwd_clk_out(fwd_clk);
+        run_workers(num_threads, [&](unsigned int t) {
+            auto& fwd_ev = thread_fwd_ev_shards[t];
+            auto& fwd_clk = thread_fwd_click_shards[t];
+            // Forwarding buffers go after the click buffers in the raw blocks' free tails
+            // (already faulted in: no new page faults).
+            HugeArena* my_tails = &tail_arenas[static_cast<size_t>(t) * TUNABLE_NUM_SHARDS];
+            reserve_shards(fwd_ev, my_tails, 1, est_fwd_ev);
+            reserve_shards(fwd_clk, my_tails, 1, est_fwd_clk);
+            ShardWriter<SurvivingEventShard> fwd_ev_out(fwd_ev);
+            ShardWriter<ValidClickShard> fwd_clk_out(fwd_clk);
 
-                constexpr uint16_t kStay = 0xFFFF;  // dest_of value: id is canonical, record stays
-                PersonIdMap id_map;                 // raw id -> distinct-id index k (this shard only)
-                std::vector<uint32_t> rec_k;        // k of each record, in pass order
-                std::vector<uint64_t> canon_of;     // canonical id of distinct id k
-                std::vector<uint16_t> dest_of;      // person shard of canon_of[k], or kStay
+            constexpr uint16_t kStay = 0xFFFF;  // dest_of value: id is canonical, record stays
+            PersonIdMap id_map;                 // raw id -> distinct-id index k (this shard only)
+            std::vector<uint32_t> rec_k;        // k of each record, in pass order
+            std::vector<uint64_t> canon_of;     // canonical id of distinct id k
+            std::vector<uint16_t> dest_of;      // person shard of canon_of[k], or kStay
 
-                while (true) {
-                    size_t sh = next_shard.fetch_add(1, std::memory_order_relaxed);
-                    if (sh >= TUNABLE_NUM_SHARDS) break;
-                    SurvSpan* const spans = &surv_spans[sh * num_blocks];
-                    size_t n_recs = 0;
-                    for (size_t b = 0; b < num_blocks; ++b) n_recs += spans[b].n;
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) n_recs += thread_person_click_shards[rt][sh].size();
-                    if (n_recs == 0) continue;
-                    id_map.reset(n_recs / TUNABLE_DISTINCT_ID_DIV + 16);
-                    if (rec_k.size() < n_recs) rec_k.resize(n_recs);
+            while (true) {
+                size_t sh = next_shard.fetch_add(1, std::memory_order_relaxed);
+                if (sh >= TUNABLE_NUM_SHARDS) break;
+                SurvSpan* const spans = &surv_spans[sh * num_blocks];
+                size_t n_recs = 0;
+                for (size_t b = 0; b < num_blocks; ++b) n_recs += spans[b].n;
+                for (unsigned int rt = 0; rt < num_threads; ++rt) n_recs += thread_person_click_shards[rt][sh].size();
+                if (n_recs == 0) continue;
+                id_map.reset(n_recs / TUNABLE_DISTINCT_ID_DIV + 16);
+                if (rec_k.size() < n_recs) rec_k.resize(n_recs);
 
-                    // Pass 1: number the distinct raw ids (the id map stays in L2).
-                    size_t ri = 0;
-                    bool inserted = false;
-                    for (size_t b = 0; b < num_blocks; ++b) {
-                        if (b + TUNABLE_SPAN_PREFETCH_DIST < num_blocks) prefetch_span(spans[b + TUNABLE_SPAN_PREFETCH_DIST]);
-                        const SurvivingEventRecord* p = spans[b].p;
-                        for (uint32_t i = 0, n = spans[b].n; i < n; ++i) rec_k[ri++] = id_map.find_or_insert(p[i].user_id, inserted);
-                    }
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        for (const auto& rec : thread_person_click_shards[rt][sh]) rec_k[ri++] = id_map.find_or_insert(rec.user_id, inserted);
-                    }
-
-                    // Resolve every distinct id once. Link-table lookups miss cache, so prefetch
-                    // later ids' slots to keep several misses in flight.
-                    const auto& ids = id_map.persons;
-                    const size_t n_ids = ids.size();
-                    canon_of.resize(n_ids);
-                    dest_of.resize(n_ids);
-                    for (size_t j = 0; j < n_ids; ++j) {
-                        if (j + TUNABLE_RESOLVE_PREFETCH_DIST < n_ids) dsu.prefetch(hash_id64(ids[j + TUNABLE_RESOLVE_PREFETCH_DIST]));
-                        uint64_t raw = ids[j];
-                        uint64_t c = dsu.resolve(raw, hash_id64(raw));
-                        canon_of[j] = c;
-                        dest_of[j] = (c == raw) ? kStay : static_cast<uint16_t>(hash_id64(c) & SHARD_MASK);
-                    }
-
-                    // Pass 2: compact each source vector in place; canonical records stay, the rest move.
-                    ri = 0;
-                    for (size_t b = 0; b < num_blocks; ++b) {
-                        if (b + TUNABLE_SPAN_PREFETCH_DIST < num_blocks) prefetch_span(spans[b + TUNABLE_SPAN_PREFETCH_DIST]);
-                        SurvivingEventRecord* v = spans[b].p;
-                        const uint32_t n = spans[b].n;
-                        uint32_t keep = 0;
-                        for (uint32_t i = 0; i < n; ++i) {
-                            SurvivingEventRecord rec = v[i];
-                            uint32_t k = rec_k[ri++];
-                            uint16_t d = dest_of[k];
-                            if (d == kStay) {
-                                v[keep++] = rec;
-                            } else {
-                                rec.user_id = canon_of[k];
-                                fwd_ev_out.push(d, rec);
-                            }
-                        }
-                        spans[b].n = keep;
-                    }
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        auto& v = thread_person_click_shards[rt][sh];
-                        size_t keep = 0;
-                        for (size_t i = 0; i < v.size(); ++i) {
-                            ValidClickRecord rec = v[i];
-                            uint32_t k = rec_k[ri++];
-                            uint16_t d = dest_of[k];
-                            if (d == kStay) {
-                                v[keep++] = rec;
-                            } else {
-                                rec.user_id = canon_of[k];
-                                fwd_clk_out.push(d, rec);
-                            }
-                        }
-                        v.resize(keep);
-                    }
+                // Pass 1: number the distinct raw ids (the id map stays in L2).
+                size_t ri = 0;
+                bool inserted = false;
+                for (size_t b = 0; b < num_blocks; ++b) {
+                    if (b + TUNABLE_SPAN_PREFETCH_DIST < num_blocks) prefetch_span(spans[b + TUNABLE_SPAN_PREFETCH_DIST]);
+                    const SurvivingEventRecord* p = spans[b].p;
+                    for (uint32_t i = 0, n = spans[b].n; i < n; ++i) rec_k[ri++] = id_map.find_or_insert(p[i].user_id, inserted);
                 }
-            });
-        }
-        for (auto& w : workers) w.join();
+                for (unsigned int rt = 0; rt < num_threads; ++rt) {
+                    for (const auto& rec : thread_person_click_shards[rt][sh]) rec_k[ri++] = id_map.find_or_insert(rec.user_id, inserted);
+                }
+
+                // Resolve every distinct id once. Link-table lookups miss cache, so prefetch
+                // later ids' slots to keep several misses in flight.
+                const auto& ids = id_map.persons;
+                const size_t n_ids = ids.size();
+                canon_of.resize(n_ids);
+                dest_of.resize(n_ids);
+                for (size_t j = 0; j < n_ids; ++j) {
+                    if (j + TUNABLE_RESOLVE_PREFETCH_DIST < n_ids) dsu.prefetch(hash_id64(ids[j + TUNABLE_RESOLVE_PREFETCH_DIST]));
+                    uint64_t raw = ids[j];
+                    uint64_t c = dsu.resolve(raw, hash_id64(raw));
+                    canon_of[j] = c;
+                    dest_of[j] = (c == raw) ? kStay : static_cast<uint16_t>(hash_id64(c) & SHARD_MASK);
+                }
+
+                // Pass 2: compact each source vector in place; canonical records stay, the rest move.
+                ri = 0;
+                for (size_t b = 0; b < num_blocks; ++b) {
+                    if (b + TUNABLE_SPAN_PREFETCH_DIST < num_blocks) prefetch_span(spans[b + TUNABLE_SPAN_PREFETCH_DIST]);
+                    SurvivingEventRecord* v = spans[b].p;
+                    const uint32_t n = spans[b].n;
+                    uint32_t keep = 0;
+                    for (uint32_t i = 0; i < n; ++i) {
+                        SurvivingEventRecord rec = v[i];
+                        uint32_t k = rec_k[ri++];
+                        uint16_t d = dest_of[k];
+                        if (d == kStay) {
+                            v[keep++] = rec;
+                        } else {
+                            rec.user_id = canon_of[k];
+                            fwd_ev_out.push(d, rec);
+                        }
+                    }
+                    spans[b].n = keep;
+                }
+                for (unsigned int rt = 0; rt < num_threads; ++rt) {
+                    auto& v = thread_person_click_shards[rt][sh];
+                    size_t keep = 0;
+                    for (size_t i = 0; i < v.size(); ++i) {
+                        ValidClickRecord rec = v[i];
+                        uint32_t k = rec_k[ri++];
+                        uint16_t d = dest_of[k];
+                        if (d == kStay) {
+                            v[keep++] = rec;
+                        } else {
+                            rec.user_id = canon_of[k];
+                            fwd_clk_out.push(d, rec);
+                        }
+                    }
+                    v.resize(keep);
+                }
+            }
+        });
     }
 
     // Stage 4: Sessionize & Attribute
@@ -1019,280 +981,275 @@ int main(int argc, char** argv) {
                              [&](uint32_t a, uint32_t b) { return shard_load[a] > shard_load[b]; });
         }
         std::atomic<size_t> next_p_shard{0};
-        std::vector<std::thread> workers;
-        workers.reserve(num_threads);
-        size_t num_cats = category_names.size();
+        const size_t num_cats = category_names.size();
         constexpr uint32_t kLookbackMsU32 = static_cast<uint32_t>(TUNABLE_CLICK_LOOKBACK_MS);
         const int32_t ws_day = static_cast<int32_t>(floor_div_day(window_start));
         const uint64_t ws_day_off = static_cast<uint64_t>(window_start - static_cast<int64_t>(ws_day) * TUNABLE_DAY_MS);
 
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            workers.emplace_back([&, t, num_cats]() {
-                auto& out = thread_outputs[t];
-                out.camp_grid.assign(num_campaigns * num_days, CampaignCell{});
+        run_workers(num_threads, [&](unsigned int t) {
+            auto& out = thread_outputs[t];
+            out.camp_grid.assign(num_campaigns * num_days, CampaignCell{});
 
-                std::vector<int64_t> day_cat_rev(num_cats, 0);
-                std::vector<int32_t> active_camp_count(num_campaigns, 0);
-                std::vector<uint32_t> active_camp_pos(num_campaigns, 0);
-                std::vector<uint32_t> active_camps;
-                active_camps.reserve(num_campaigns);
+            std::vector<int64_t> day_cat_rev(num_cats, 0);
+            std::vector<int32_t> active_camp_count(num_campaigns, 0);
+            std::vector<uint32_t> active_camp_pos(num_campaigns, 0);
+            std::vector<uint32_t> active_camps;
+            active_camps.reserve(num_campaigns);
 
-                struct CompactClick {
-                    uint64_t click_id;
-                    uint32_t click_rel_ts;
-                    uint32_t campaign_idx;
-                };
-                struct MatchedClickRef {
-                    uint32_t pid;
-                    uint32_t rt;
-                    uint32_t ri;
-                };
+            struct CompactClick {
+                uint64_t click_id;
+                uint32_t click_rel_ts;
+                uint32_t campaign_idx;
+            };
+            struct MatchedClickRef {
+                uint32_t pid;
+                uint32_t rt;
+                uint32_t ri;
+            };
 
-                PersonIdMap person_map;
-                std::vector<uint32_t> ev_person_ids;
-                std::vector<uint32_t> person_ev_counts;
-                std::vector<uint32_t> person_ev_offsets;
-                std::vector<uint32_t> write_pos;
-                std::vector<uint64_t> csr_events;
-                std::vector<uint32_t> person_clk_counts;
-                std::vector<MatchedClickRef> matched_clicks;
-                std::vector<uint32_t> person_clk_offsets;
-                std::vector<uint32_t> clk_write_pos;
-                std::vector<CompactClick> csr_clicks;
-                std::vector<uint64_t> sort_scratch;
-                // Click sources of a person shard: [0, T) stayed in Stage 3b, [T, 2T) were forwarded to it.
-                const unsigned int num_srcs = 2 * num_threads;
-                // Event runs of a person shard: the non-empty survivor spans that stayed in Stage 3b,
-                // then the forwarded vectors.
-                std::vector<SurvSpan> ev_runs;
-                ev_runs.reserve(num_blocks + num_threads);
-                std::vector<const ValidClickShard*> clk_srcs(num_srcs);
+            PersonIdMap person_map;
+            std::vector<uint32_t> ev_person_ids;
+            std::vector<uint32_t> person_ev_counts;
+            std::vector<uint32_t> person_ev_offsets;
+            std::vector<uint32_t> write_pos;
+            std::vector<uint64_t> csr_events;
+            std::vector<uint32_t> person_clk_counts;
+            std::vector<MatchedClickRef> matched_clicks;
+            std::vector<uint32_t> person_clk_offsets;
+            std::vector<uint32_t> clk_write_pos;
+            std::vector<CompactClick> csr_clicks;
+            std::vector<uint64_t> sort_scratch;
+            // Click sources of a person shard: [0, T) stayed in Stage 3b, [T, 2T) were forwarded to it.
+            const unsigned int num_srcs = 2 * num_threads;
+            // Event runs of a person shard: the non-empty survivor spans that stayed in Stage 3b,
+            // then the forwarded vectors.
+            std::vector<SurvSpan> ev_runs;
+            ev_runs.reserve(num_blocks + num_threads);
+            std::vector<const ValidClickShard*> clk_srcs(num_srcs);
 
-                while (true) {
-                    size_t order_idx = next_p_shard.fetch_add(1, std::memory_order_relaxed);
-                    if (order_idx >= TUNABLE_NUM_SHARDS) break;
-                    size_t p_shard = shard_order[order_idx];
-                    ev_runs.clear();
-                    size_t total_evs = 0;
-                    for (size_t b = 0; b < num_blocks; ++b) {
-                        const SurvSpan& sp = surv_spans[p_shard * num_blocks + b];
-                        if (sp.n != 0) ev_runs.push_back(sp);
-                        total_evs += sp.n;
-                    }
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        auto& fv = thread_fwd_ev_shards[rt][p_shard];
-                        if (!fv.empty()) ev_runs.push_back(SurvSpan{fv.data(), static_cast<uint32_t>(fv.size())});
-                        total_evs += fv.size();
-                        clk_srcs[rt] = &thread_person_click_shards[rt][p_shard];
-                        clk_srcs[num_threads + rt] = &thread_fwd_click_shards[rt][p_shard];
-                    }
+            while (true) {
+                size_t order_idx = next_p_shard.fetch_add(1, std::memory_order_relaxed);
+                if (order_idx >= TUNABLE_NUM_SHARDS) break;
+                size_t p_shard = shard_order[order_idx];
+                ev_runs.clear();
+                size_t total_evs = 0;
+                for (size_t b = 0; b < num_blocks; ++b) {
+                    const SurvSpan& sp = surv_spans[p_shard * num_blocks + b];
+                    if (sp.n != 0) ev_runs.push_back(sp);
+                    total_evs += sp.n;
+                }
+                for (unsigned int rt = 0; rt < num_threads; ++rt) {
+                    auto& fv = thread_fwd_ev_shards[rt][p_shard];
+                    if (!fv.empty()) ev_runs.push_back(SurvSpan{fv.data(), static_cast<uint32_t>(fv.size())});
+                    total_evs += fv.size();
+                    clk_srcs[rt] = &thread_person_click_shards[rt][p_shard];
+                    clk_srcs[num_threads + rt] = &thread_fwd_click_shards[rt][p_shard];
+                }
 
-                    if (total_evs == 0) continue;
+                if (total_evs == 0) continue;
 
-                    person_map.reset(total_evs / 4 + 16);
-                    ev_person_ids.clear();
-                    ev_person_ids.reserve(total_evs);
-                    person_ev_counts.clear();
+                person_map.reset(total_evs / TUNABLE_EVENTS_PER_PERSON + 16);
+                ev_person_ids.clear();
+                ev_person_ids.reserve(total_evs);
+                person_ev_counts.clear();
 
-                    for (size_t r = 0; r < ev_runs.size(); ++r) {
-                        if (r + TUNABLE_SPAN_PREFETCH_DIST < ev_runs.size()) prefetch_span(ev_runs[r + TUNABLE_SPAN_PREFETCH_DIST]);
-                        const SurvSpan& run = ev_runs[r];
-                        for (const SurvivingEventRecord& rec : std::span<const SurvivingEventRecord>(run.p, run.n)) {
-                            bool inserted = false;
-                            uint32_t pid = person_map.find_or_insert(rec.user_id, inserted);
-                            if (inserted) {
-                                person_ev_counts.push_back(0);
-                            }
-                            ev_person_ids.push_back(pid);
-                            person_ev_counts[pid]++;
+                for (size_t r = 0; r < ev_runs.size(); ++r) {
+                    if (r + TUNABLE_SPAN_PREFETCH_DIST < ev_runs.size()) prefetch_span(ev_runs[r + TUNABLE_SPAN_PREFETCH_DIST]);
+                    const SurvSpan& run = ev_runs[r];
+                    for (const SurvivingEventRecord& rec : std::span<const SurvivingEventRecord>(run.p, run.n)) {
+                        bool inserted = false;
+                        uint32_t pid = person_map.find_or_insert(rec.user_id, inserted);
+                        if (inserted) {
+                            person_ev_counts.push_back(0);
                         }
-                    }
-
-                    size_t num_persons = person_ev_counts.size();
-                    person_ev_offsets.resize(num_persons + 1);
-                    person_ev_offsets[0] = 0;
-                    for (size_t p = 0; p < num_persons; ++p) {
-                        person_ev_offsets[p + 1] = person_ev_offsets[p] + person_ev_counts[p];
-                    }
-                    write_pos = person_ev_offsets;
-                    csr_events.resize(total_evs);
-
-                    size_t global_ei = 0;
-                    for (size_t r = 0; r < ev_runs.size(); ++r) {
-                        if (r + TUNABLE_SPAN_PREFETCH_DIST < ev_runs.size()) prefetch_span(ev_runs[r + TUNABLE_SPAN_PREFETCH_DIST]);
-                        const SurvSpan& run = ev_runs[r];
-                        for (const SurvivingEventRecord& rec : std::span<const SurvivingEventRecord>(run.p, run.n)) {
-                            uint32_t pid = ev_person_ids[global_ei++];
-                            csr_events[write_pos[pid]++] = rec.packed_ev;
-                        }
-                    }
-
-                    person_clk_counts.assign(num_persons, 0);
-                    matched_clicks.clear();
-                    for (unsigned int k = 0; k < num_srcs; ++k) {
-                        const auto& recs = *clk_srcs[k];
-                        for (uint32_t ri = 0; ri < recs.size(); ++ri) {
-                            const auto& rec = recs[ri];
-                            uint32_t pid = person_map.lookup(rec.user_id);
-                            if (pid != 0xFFFFFFFFu) {
-                                person_clk_counts[pid]++;
-                                matched_clicks.push_back(MatchedClickRef{pid, k, ri});
-                            }
-                        }
-                    }
-
-                    person_clk_offsets.resize(num_persons + 1);
-                    person_clk_offsets[0] = 0;
-                    for (size_t p = 0; p < num_persons; ++p) {
-                        person_clk_offsets[p + 1] = person_clk_offsets[p] + person_clk_counts[p];
-                    }
-                    clk_write_pos = person_clk_offsets;
-                    csr_clicks.resize(matched_clicks.size());
-                    for (const auto& mc : matched_clicks) {
-                        const auto& rec = (*clk_srcs[mc.rt])[mc.ri];
-                        csr_clicks[clk_write_pos[mc.pid]++] = CompactClick{
-                            rec.click_id, rec.click_rel_ts, rec.campaign_idx
-                        };
-                    }
-
-                    for (size_t p = 0; p < num_persons; ++p) {
-                        uint64_t* ev_begin = csr_events.data() + person_ev_offsets[p];
-                        uint64_t* ev_end = csr_events.data() + person_ev_offsets[p + 1];
-                        size_t n_ev = static_cast<size_t>(ev_end - ev_begin);
-                        if (n_ev > 1) {
-                            sort_events_u64(ev_begin, n_ev, sort_scratch);
-                        }
-
-                        auto* clk_begin = csr_clicks.data() + person_clk_offsets[p];
-                        auto* clk_end = csr_clicks.data() + person_clk_offsets[p + 1];
-                        if (clk_end - clk_begin > 1) {
-                            std::sort(clk_begin, clk_end, [](const CompactClick& a, const CompactClick& b) {
-                                if (a.click_rel_ts != b.click_rel_ts) return a.click_rel_ts < b.click_rel_ts;
-                                return a.click_id > b.click_id;
-                            });
-                            clk_end = std::unique(clk_begin, clk_end, [](const CompactClick& a, const CompactClick& b) {
-                                return a.click_rel_ts == b.click_rel_ts && a.click_id == b.click_id;
-                            });
-                        }
-                        size_t n_clk = static_cast<size_t>(clk_end - clk_begin);
-                        size_t clk_L = 0, clk_R = 0;
-
-                        uint64_t user_id = person_map.persons[p];
-
-                        int32_t cur_day = std::numeric_limits<int32_t>::min();
-                        int32_t day_sessions = 0;
-                        int32_t day_events = 0;
-                        int64_t day_revenue = 0;
-
-                        auto flush_user_day = [&]() {
-                            if (day_sessions == 0) return;
-                            int16_t top_cat = -1;
-                            if (day_revenue > 0) {
-                                int64_t best_rev = 0;
-                                for (size_t c = 0; c < num_cats; ++c) {
-                                    if (day_cat_rev[c] > best_rev) {
-                                        best_rev = day_cat_rev[c];
-                                        top_cat = static_cast<int16_t>(c);
-                                    }
-                                    day_cat_rev[c] = 0;
-                                }
-                            }
-                            out.user_rows.push_back(parquet::UserDailyRow{
-                                user_id,
-                                day_revenue,
-                                cur_day,
-                                day_sessions,
-                                day_events,
-                                top_cat,
-                                0
-                            });
-                        };
-
-                        size_t i = 0;
-                        while (i < n_ev) {
-                            uint32_t start_rel_ts = static_cast<uint32_t>(ev_begin[i] >> 32);
-                            // floor((window_start + rel) / DAY) with a non-negative unsigned dividend:
-                            // the compiler turns the constant division into a multiply-high.
-                            int32_t s_day = ws_day + static_cast<int32_t>(
-                                (static_cast<uint64_t>(start_rel_ts) + ws_day_off) / static_cast<uint64_t>(TUNABLE_DAY_MS));
-                            if (s_day != cur_day) {
-                                flush_user_day();
-                                cur_day = s_day;
-                                day_sessions = 0;
-                                day_events = 0;
-                                day_revenue = 0;
-                            }
-
-                            int32_t s_events = 0;
-                            int64_t s_rev = 0;
-                            size_t j = i;
-                            uint32_t prev_rel_ts = start_rel_ts;
-                            while (j < n_ev) {
-                                uint64_t pev = ev_begin[j];
-                                uint32_t cur_rel_ts = static_cast<uint32_t>(pev >> 32);
-                                if (j > i && static_cast<int64_t>(cur_rel_ts - prev_rel_ts) > TUNABLE_SESSION_GAP_MS) {
-                                    break;
-                                }
-                                prev_rel_ts = cur_rel_ts;
-                                s_events++;
-                                uint32_t price = static_cast<uint32_t>(pev) & 0xFFFFFFu;
-                                if (price > 0) {
-                                    uint16_t cat_idx = static_cast<uint16_t>((static_cast<uint32_t>(pev) >> 24) & 0x7Fu);
-                                    s_rev += price;
-                                    day_cat_rev[cat_idx] += price;
-                                }
-                                j++;
-                            }
-                            i = j;
-
-                            day_sessions += 1;
-                            day_events += s_events;
-                            day_revenue += s_rev;
-                            bool s_has_purchase = (s_rev > 0);
-
-                            uint32_t max_click_rel_ts = start_rel_ts + kLookbackMsU32;
-                            while (clk_R < n_clk && clk_begin[clk_R].click_rel_ts <= max_click_rel_ts) {
-                                uint32_t c = clk_begin[clk_R].campaign_idx;
-                                if (active_camp_count[c]++ == 0) {
-                                    active_camp_pos[c] = static_cast<uint32_t>(active_camps.size());
-                                    active_camps.push_back(c);
-                                }
-                                clk_R++;
-                            }
-                            while (clk_L < clk_R && clk_begin[clk_L].click_rel_ts < start_rel_ts) {
-                                uint32_t c = clk_begin[clk_L].campaign_idx;
-                                if (--active_camp_count[c] == 0) {
-                                    uint32_t pos = active_camp_pos[c];
-                                    uint32_t last_c = active_camps.back();
-                                    active_camps[pos] = last_c;
-                                    active_camp_pos[last_c] = pos;
-                                    active_camps.pop_back();
-                                }
-                                clk_L++;
-                            }
-
-                            size_t day_off = static_cast<size_t>(s_day - base_day);
-                            uint32_t credited_camp = (clk_L < clk_R) ? clk_begin[clk_R - 1].campaign_idx : organic_campaign_idx;
-                            auto& cred_agg = out.camp_grid[credited_camp * num_days + day_off];
-                            cred_agg.sessions += 1;
-                            if (s_has_purchase) cred_agg.purchasing_sessions += 1;
-                            cred_agg.revenue_cents += s_rev;
-
-                            for (uint32_t ac : active_camps) {
-                                out.camp_grid[ac * num_days + day_off].assisted_sessions += 1;
-                            }
-                        }
-
-                        flush_user_day();
-                        for (uint32_t ac : active_camps) {
-                            active_camp_count[ac] = 0;
-                        }
-                        active_camps.clear();
+                        ev_person_ids.push_back(pid);
+                        person_ev_counts[pid]++;
                     }
                 }
-            });
-        }
-        for (auto& w : workers) w.join();
+
+                size_t num_persons = person_ev_counts.size();
+                person_ev_offsets.resize(num_persons + 1);
+                person_ev_offsets[0] = 0;
+                for (size_t p = 0; p < num_persons; ++p) {
+                    person_ev_offsets[p + 1] = person_ev_offsets[p] + person_ev_counts[p];
+                }
+                write_pos = person_ev_offsets;
+                csr_events.resize(total_evs);
+
+                size_t global_ei = 0;
+                for (size_t r = 0; r < ev_runs.size(); ++r) {
+                    if (r + TUNABLE_SPAN_PREFETCH_DIST < ev_runs.size()) prefetch_span(ev_runs[r + TUNABLE_SPAN_PREFETCH_DIST]);
+                    const SurvSpan& run = ev_runs[r];
+                    for (const SurvivingEventRecord& rec : std::span<const SurvivingEventRecord>(run.p, run.n)) {
+                        uint32_t pid = ev_person_ids[global_ei++];
+                        csr_events[write_pos[pid]++] = rec.packed_ev;
+                    }
+                }
+
+                person_clk_counts.assign(num_persons, 0);
+                matched_clicks.clear();
+                for (unsigned int k = 0; k < num_srcs; ++k) {
+                    const auto& recs = *clk_srcs[k];
+                    for (uint32_t ri = 0; ri < recs.size(); ++ri) {
+                        const auto& rec = recs[ri];
+                        uint32_t pid = person_map.lookup(rec.user_id);
+                        if (pid != 0xFFFFFFFFu) {
+                            person_clk_counts[pid]++;
+                            matched_clicks.push_back(MatchedClickRef{pid, k, ri});
+                        }
+                    }
+                }
+
+                person_clk_offsets.resize(num_persons + 1);
+                person_clk_offsets[0] = 0;
+                for (size_t p = 0; p < num_persons; ++p) {
+                    person_clk_offsets[p + 1] = person_clk_offsets[p] + person_clk_counts[p];
+                }
+                clk_write_pos = person_clk_offsets;
+                csr_clicks.resize(matched_clicks.size());
+                for (const auto& mc : matched_clicks) {
+                    const auto& rec = (*clk_srcs[mc.rt])[mc.ri];
+                    csr_clicks[clk_write_pos[mc.pid]++] = CompactClick{
+                        rec.click_id, rec.click_rel_ts, rec.campaign_idx
+                    };
+                }
+
+                for (size_t p = 0; p < num_persons; ++p) {
+                    uint64_t* ev_begin = csr_events.data() + person_ev_offsets[p];
+                    uint64_t* ev_end = csr_events.data() + person_ev_offsets[p + 1];
+                    size_t n_ev = static_cast<size_t>(ev_end - ev_begin);
+                    if (n_ev > 1) {
+                        sort_events_u64(ev_begin, n_ev, sort_scratch);
+                    }
+
+                    auto* clk_begin = csr_clicks.data() + person_clk_offsets[p];
+                    auto* clk_end = csr_clicks.data() + person_clk_offsets[p + 1];
+                    if (clk_end - clk_begin > 1) {
+                        std::sort(clk_begin, clk_end, [](const CompactClick& a, const CompactClick& b) {
+                            if (a.click_rel_ts != b.click_rel_ts) return a.click_rel_ts < b.click_rel_ts;
+                            return a.click_id > b.click_id;
+                        });
+                        clk_end = std::unique(clk_begin, clk_end, [](const CompactClick& a, const CompactClick& b) {
+                            return a.click_rel_ts == b.click_rel_ts && a.click_id == b.click_id;
+                        });
+                    }
+                    size_t n_clk = static_cast<size_t>(clk_end - clk_begin);
+                    size_t clk_L = 0, clk_R = 0;
+
+                    uint64_t user_id = person_map.persons[p];
+
+                    int32_t cur_day = std::numeric_limits<int32_t>::min();
+                    int32_t day_sessions = 0;
+                    int32_t day_events = 0;
+                    int64_t day_revenue = 0;
+
+                    auto flush_user_day = [&]() {
+                        if (day_sessions == 0) return;
+                        int16_t top_cat = -1;
+                        if (day_revenue > 0) {
+                            int64_t best_rev = 0;
+                            for (size_t c = 0; c < num_cats; ++c) {
+                                if (day_cat_rev[c] > best_rev) {
+                                    best_rev = day_cat_rev[c];
+                                    top_cat = static_cast<int16_t>(c);
+                                }
+                                day_cat_rev[c] = 0;
+                            }
+                        }
+                        out.user_rows.push_back(parquet::UserDailyRow{
+                            user_id,
+                            day_revenue,
+                            cur_day,
+                            day_sessions,
+                            day_events,
+                            top_cat,
+                            0
+                        });
+                    };
+
+                    size_t i = 0;
+                    while (i < n_ev) {
+                        uint32_t start_rel_ts = static_cast<uint32_t>(ev_begin[i] >> 32);
+                        // floor((window_start + rel) / DAY) with a non-negative unsigned dividend:
+                        // the compiler turns the constant division into a multiply-high.
+                        int32_t s_day = ws_day + static_cast<int32_t>(
+                            (static_cast<uint64_t>(start_rel_ts) + ws_day_off) / static_cast<uint64_t>(TUNABLE_DAY_MS));
+                        if (s_day != cur_day) {
+                            flush_user_day();
+                            cur_day = s_day;
+                            day_sessions = 0;
+                            day_events = 0;
+                            day_revenue = 0;
+                        }
+
+                        int32_t s_events = 0;
+                        int64_t s_rev = 0;
+                        size_t j = i;
+                        uint32_t prev_rel_ts = start_rel_ts;
+                        while (j < n_ev) {
+                            uint64_t pev = ev_begin[j];
+                            uint32_t cur_rel_ts = static_cast<uint32_t>(pev >> 32);
+                            if (j > i && static_cast<int64_t>(cur_rel_ts - prev_rel_ts) > TUNABLE_SESSION_GAP_MS) {
+                                break;
+                            }
+                            prev_rel_ts = cur_rel_ts;
+                            s_events++;
+                            uint32_t price = static_cast<uint32_t>(pev) & 0xFFFFFFu;
+                            if (price > 0) {
+                                uint16_t cat_idx = static_cast<uint16_t>((static_cast<uint32_t>(pev) >> 24) & 0x7Fu);
+                                s_rev += price;
+                                day_cat_rev[cat_idx] += price;
+                            }
+                            j++;
+                        }
+                        i = j;
+
+                        day_sessions += 1;
+                        day_events += s_events;
+                        day_revenue += s_rev;
+                        bool s_has_purchase = (s_rev > 0);
+
+                        uint32_t max_click_rel_ts = start_rel_ts + kLookbackMsU32;
+                        while (clk_R < n_clk && clk_begin[clk_R].click_rel_ts <= max_click_rel_ts) {
+                            uint32_t c = clk_begin[clk_R].campaign_idx;
+                            if (active_camp_count[c]++ == 0) {
+                                active_camp_pos[c] = static_cast<uint32_t>(active_camps.size());
+                                active_camps.push_back(c);
+                            }
+                            clk_R++;
+                        }
+                        while (clk_L < clk_R && clk_begin[clk_L].click_rel_ts < start_rel_ts) {
+                            uint32_t c = clk_begin[clk_L].campaign_idx;
+                            if (--active_camp_count[c] == 0) {
+                                uint32_t pos = active_camp_pos[c];
+                                uint32_t last_c = active_camps.back();
+                                active_camps[pos] = last_c;
+                                active_camp_pos[last_c] = pos;
+                                active_camps.pop_back();
+                            }
+                            clk_L++;
+                        }
+
+                        size_t day_off = static_cast<size_t>(s_day - base_day);
+                        uint32_t credited_camp = (clk_L < clk_R) ? clk_begin[clk_R - 1].campaign_idx : organic_campaign_idx;
+                        auto& cred_agg = out.camp_grid[credited_camp * num_days + day_off];
+                        cred_agg.sessions += 1;
+                        if (s_has_purchase) cred_agg.purchasing_sessions += 1;
+                        cred_agg.revenue_cents += s_rev;
+
+                        for (uint32_t ac : active_camps) {
+                            out.camp_grid[ac * num_days + day_off].assisted_sessions += 1;
+                        }
+                    }
+
+                    flush_user_day();
+                    for (uint32_t ac : active_camps) {
+                        active_camp_count[ac] = 0;
+                    }
+                    active_camps.clear();
+                }
+            }
+        });
     }
 
     // Stage 5: Parallel Multi-File Parquet Output
@@ -1300,63 +1257,28 @@ int main(int argc, char** argv) {
     fs::create_directories(fs::path(out_dir) / "user_daily");
     fs::create_directories(fs::path(out_dir) / "campaign_daily");
 
-    bool any_user_rows = false;
-    for (const auto& to : thread_outputs) {
-        if (!to.user_rows.empty()) {
-            any_user_rows = true;
-            break;
-        }
-    }
-
-    if (!any_user_rows) {
-        std::vector<parquet::UserDailyRow> empty_rows;
+    // One file per worker with rows; part-0 is always written so the table exists when empty.
+    run_workers(num_threads, [&](unsigned int t) {
+        if (t != 0 && thread_outputs[t].user_rows.empty()) return;
         parquet::write_user_daily_parquet(
-            (fs::path(out_dir) / "user_daily" / "part-0.parquet").string(),
-            empty_rows,
+            (fs::path(out_dir) / "user_daily" / ("part-" + std::to_string(t) + ".parquet")).string(),
+            thread_outputs[t].user_rows,
             category_names
         );
-    } else {
-        std::vector<std::thread> writers;
-        writers.reserve(num_threads);
-        for (unsigned int t = 0; t < num_threads; ++t) {
-            if (thread_outputs[t].user_rows.empty()) continue;
-            writers.emplace_back([&, t]() {
-                std::string fname = "part-" + std::to_string(t) + ".parquet";
-                parquet::write_user_daily_parquet(
-                    (fs::path(out_dir) / "user_daily" / fname).string(),
-                    thread_outputs[t].user_rows,
-                    category_names
-                );
-            });
-        }
-        for (auto& w : writers) w.join();
-    }
-
-    std::vector<CampaignAgg> merged_grid(num_campaigns * num_days, CampaignAgg{});
-    for (const auto& to : thread_outputs) {
-        for (size_t idx = 0; idx < merged_grid.size(); ++idx) {
-            merged_grid[idx].sessions += to.camp_grid[idx].sessions;
-            merged_grid[idx].purchasing_sessions += to.camp_grid[idx].purchasing_sessions;
-            merged_grid[idx].revenue_cents += to.camp_grid[idx].revenue_cents;
-            merged_grid[idx].assisted_sessions += to.camp_grid[idx].assisted_sessions;
-        }
-    }
+    });
 
     std::vector<parquet::CampaignDailyRow> final_camp_rows;
     for (size_t c = 0; c < num_campaigns; ++c) {
         for (size_t d = 0; d < num_days; ++d) {
-            const auto& agg = merged_grid[c * num_days + d];
-            if (agg.sessions > 0 || agg.assisted_sessions > 0) {
-                final_camp_rows.push_back(parquet::CampaignDailyRow{
-                    campaign_ids[c],
-                    campaign_channels[c],
-                    base_day + static_cast<int32_t>(d),
-                    agg.sessions,
-                    agg.purchasing_sessions,
-                    agg.revenue_cents,
-                    agg.assisted_sessions
-                });
+            parquet::CampaignDailyRow row{campaign_ids[c], campaign_channels[c], base_day + static_cast<int32_t>(d), 0, 0, 0, 0};
+            for (const auto& to : thread_outputs) {
+                const CampaignCell& cell = to.camp_grid[c * num_days + d];
+                row.sessions += cell.sessions;
+                row.purchasing_sessions += cell.purchasing_sessions;
+                row.revenue_cents += cell.revenue_cents;
+                row.assisted_sessions += cell.assisted_sessions;
             }
+            if (row.sessions > 0 || row.assisted_sessions > 0) final_camp_rows.push_back(row);
         }
     }
     parquet::write_campaign_daily_parquet(

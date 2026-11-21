@@ -15,9 +15,7 @@ constexpr bool TUNABLE_ARENA_USE_HUGEPAGES = true;            // madvise(MADV_HU
 #include <type_traits>
 #include <utility>
 
-#ifdef __linux__
 #include <sys/mman.h>
-#endif
 
 namespace pipeline {
 
@@ -33,12 +31,20 @@ public:
     HugeArena(const HugeArena&) = delete;
     HugeArena& operator=(const HugeArena&) = delete;
 
-    // Makes the arena empty with room for `bytes`. Memory already mapped (and faulted in)
-    // is reused when it is big enough; blocks handed out earlier become invalid.
+    // Maps a fresh region with room for `bytes` (called once per arena); pages are committed
+    // on first touch. On failure the arena stays empty and every alloc falls back to the heap.
     void prepare(size_t bytes) {
-        used_ = 0;
-        if (base_ != nullptr && bytes <= cap_) return;
-        init(bytes);
+        size_t cap = (bytes + TUNABLE_ARENA_ALIGN_BYTES - 1) & ~(TUNABLE_ARENA_ALIGN_BYTES - 1);
+        if (cap == 0) return;
+        size_t span = cap + TUNABLE_ARENA_ALIGN_BYTES;
+        void* raw = ::mmap(nullptr, span, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (raw == MAP_FAILED) return;
+        uintptr_t a = (reinterpret_cast<uintptr_t>(raw) + TUNABLE_ARENA_ALIGN_BYTES - 1) &
+                      ~static_cast<uintptr_t>(TUNABLE_ARENA_ALIGN_BYTES - 1);
+        base_ = reinterpret_cast<char*>(a);
+        if (TUNABLE_ARENA_USE_HUGEPAGES) ::madvise(base_, cap, MADV_HUGEPAGE);
+        cap_ = cap;
     }
 
     // Makes the arena hand out [base, base + bytes): memory owned by someone else that is
@@ -49,30 +55,6 @@ public:
         used_ = 0;
     }
 
-private:
-    // Reserves address space for `bytes`; pages are committed on first touch.
-    void init(size_t bytes) {
-        base_ = nullptr;
-        cap_ = 0;
-        size_t cap = (bytes + TUNABLE_ARENA_ALIGN_BYTES - 1) & ~(TUNABLE_ARENA_ALIGN_BYTES - 1);
-        if (cap == 0) return;
-#ifdef __linux__
-        size_t span = cap + TUNABLE_ARENA_ALIGN_BYTES;
-        void* raw = ::mmap(nullptr, span, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (raw == MAP_FAILED) return;
-        uintptr_t a = (reinterpret_cast<uintptr_t>(raw) + TUNABLE_ARENA_ALIGN_BYTES - 1) &
-                      ~static_cast<uintptr_t>(TUNABLE_ARENA_ALIGN_BYTES - 1);
-        base_ = reinterpret_cast<char*>(a);
-        if (TUNABLE_ARENA_USE_HUGEPAGES) ::madvise(base_, cap, MADV_HUGEPAGE);
-        cap_ = cap;
-#else
-        base_ = static_cast<char*>(::operator new(cap, std::align_val_t{64}));
-        cap_ = cap;
-#endif
-    }
-
-public:
     // Returns nullptr when the arena is exhausted (callers fall back to the heap).
     void* alloc(size_t n, size_t align) {
         size_t off = (used_ + align - 1) & ~(align - 1);
