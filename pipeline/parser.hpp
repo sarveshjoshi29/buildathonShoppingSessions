@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================================
-// TUNABLE PARAMETERS 
+// TUNABLE PARAMETERS (Must remain at the start of the file per AGENTS.md)
 // ============================================================================
 #include <cstdint>
 
@@ -35,14 +35,19 @@ constexpr bool is_ascii_digit(char c) {
 }
 
 inline int parse_2digits(const char* p) {
-    if (!is_ascii_digit(p[0]) || !is_ascii_digit(p[1])) return -1;
-    return (p[0] - '0') * 10 + (p[1] - '0');
+    unsigned int d0 = static_cast<unsigned int>(static_cast<unsigned char>(p[0]) - '0');
+    unsigned int d1 = static_cast<unsigned int>(static_cast<unsigned char>(p[1]) - '0');
+    if ((d0 > 9) | (d1 > 9)) return -1;
+    return static_cast<int>(d0 * 10 + d1);
 }
 
 inline int parse_4digits(const char* p) {
-    if (!is_ascii_digit(p[0]) || !is_ascii_digit(p[1]) ||
-        !is_ascii_digit(p[2]) || !is_ascii_digit(p[3])) return -1;
-    return (p[0] - '0') * 1000 + (p[1] - '0') * 100 + (p[2] - '0') * 10 + (p[3] - '0');
+    unsigned int d0 = static_cast<unsigned int>(static_cast<unsigned char>(p[0]) - '0');
+    unsigned int d1 = static_cast<unsigned int>(static_cast<unsigned char>(p[1]) - '0');
+    unsigned int d2 = static_cast<unsigned int>(static_cast<unsigned char>(p[2]) - '0');
+    unsigned int d3 = static_cast<unsigned int>(static_cast<unsigned char>(p[3]) - '0');
+    if ((d0 > 9) | (d1 > 9) | (d2 > 9) | (d3 > 9)) return -1;
+    return static_cast<int>(d0 * 1000 + d1 * 100 + d2 * 10 + d3);
 }
 
 constexpr bool is_leap_year(int year) {
@@ -83,21 +88,44 @@ struct PrecomputedCalendar {
 
 inline constexpr PrecomputedCalendar kCalendar{};
 
-// Fast F1 timestamp parser for ingest_ts (guaranteed F1: YYYY-MM-DDTHH:MM:SSZ)
+// Branch-collapsed SWAR-style F1 timestamp parser for ingest_ts (YYYY-MM-DDTHH:MM:SSZ)
 inline bool parse_timestamp_f1(std::string_view sv, int64_t& out_ms) {
     if (sv.size() != 20) return false;
     const char* s = sv.data();
-    if (s[10] != 'T' || s[19] != 'Z' || s[4] != '-' || s[7] != '-' || s[13] != ':' || s[16] != ':') return false;
+    if (((s[10] ^ 'T') | (s[19] ^ 'Z') | (s[4] ^ '-') | (s[7] ^ '-') | (s[13] ^ ':') | (s[16] ^ ':')) != 0) {
+        return false;
+    }
 
-    int year = parse_4digits(s);
-    int month = parse_2digits(s + 5);
-    int day = parse_2digits(s + 8);
-    int hour = parse_2digits(s + 11);
-    int minute = parse_2digits(s + 14);
-    int second = parse_2digits(s + 17);
+    unsigned int y0 = static_cast<unsigned char>(s[0]) - '0';
+    unsigned int y1 = static_cast<unsigned char>(s[1]) - '0';
+    unsigned int y2 = static_cast<unsigned char>(s[2]) - '0';
+    unsigned int y3 = static_cast<unsigned char>(s[3]) - '0';
+    unsigned int m0 = static_cast<unsigned char>(s[5]) - '0';
+    unsigned int m1 = static_cast<unsigned char>(s[6]) - '0';
+    unsigned int d0 = static_cast<unsigned char>(s[8]) - '0';
+    unsigned int d1 = static_cast<unsigned char>(s[9]) - '0';
+    unsigned int h0 = static_cast<unsigned char>(s[11]) - '0';
+    unsigned int h1 = static_cast<unsigned char>(s[12]) - '0';
+    unsigned int mi0 = static_cast<unsigned char>(s[14]) - '0';
+    unsigned int mi1 = static_cast<unsigned char>(s[15]) - '0';
+    unsigned int s0 = static_cast<unsigned char>(s[17]) - '0';
+    unsigned int s1 = static_cast<unsigned char>(s[18]) - '0';
 
-    if (year < 0 || month < 1 || month > 12 || day < 1) return false;
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return false;
+    if ((y0 > 9) | (y1 > 9) | (y2 > 9) | (y3 > 9) |
+        (m0 > 9) | (m1 > 9) | (d0 > 9) | (d1 > 9) |
+        (h0 > 9) | (h1 > 9) | (mi0 > 9) | (mi1 > 9) |
+        (s0 > 9) | (s1 > 9)) {
+        return false;
+    }
+
+    int year = static_cast<int>(y0 * 1000 + y1 * 100 + y2 * 10 + y3);
+    int month = static_cast<int>(m0 * 10 + m1);
+    int day = static_cast<int>(d0 * 10 + d1);
+    int hour = static_cast<int>(h0 * 10 + h1);
+    int minute = static_cast<int>(mi0 * 10 + mi1);
+    int second = static_cast<int>(s0 * 10 + s1);
+
+    if ((month < 1) | (month > 12) | (day < 1) | (hour > 23) | (minute > 59) | (second > 59)) return false;
 
     int64_t days;
     unsigned int y_idx = static_cast<unsigned int>(year - TUNABLE_CAL_BASE_YEAR);
@@ -120,17 +148,38 @@ inline bool parse_timestamp(std::string_view sv, int64_t& out_ms) {
     size_t len = sv.size();
 
     if ((len == 20 || len == 25) && s[10] == 'T') {
-        if (s[4] != '-' || s[7] != '-' || s[13] != ':' || s[16] != ':') return false;
+        if (((s[4] ^ '-') | (s[7] ^ '-') | (s[13] ^ ':') | (s[16] ^ ':')) != 0) return false;
 
-        int year = parse_4digits(s);
-        int month = parse_2digits(s + 5);
-        int day = parse_2digits(s + 8);
-        int hour = parse_2digits(s + 11);
-        int minute = parse_2digits(s + 14);
-        int second = parse_2digits(s + 17);
+        unsigned int y0 = static_cast<unsigned char>(s[0]) - '0';
+        unsigned int y1 = static_cast<unsigned char>(s[1]) - '0';
+        unsigned int y2 = static_cast<unsigned char>(s[2]) - '0';
+        unsigned int y3 = static_cast<unsigned char>(s[3]) - '0';
+        unsigned int m0 = static_cast<unsigned char>(s[5]) - '0';
+        unsigned int m1 = static_cast<unsigned char>(s[6]) - '0';
+        unsigned int d0 = static_cast<unsigned char>(s[8]) - '0';
+        unsigned int d1 = static_cast<unsigned char>(s[9]) - '0';
+        unsigned int h0 = static_cast<unsigned char>(s[11]) - '0';
+        unsigned int h1 = static_cast<unsigned char>(s[12]) - '0';
+        unsigned int mi0 = static_cast<unsigned char>(s[14]) - '0';
+        unsigned int mi1 = static_cast<unsigned char>(s[15]) - '0';
+        unsigned int s0 = static_cast<unsigned char>(s[17]) - '0';
+        unsigned int s1 = static_cast<unsigned char>(s[18]) - '0';
 
-        if (year < 0 || month < 1 || month > 12 || day < 1) return false;
-        if (hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59) return false;
+        if ((y0 > 9) | (y1 > 9) | (y2 > 9) | (y3 > 9) |
+            (m0 > 9) | (m1 > 9) | (d0 > 9) | (d1 > 9) |
+            (h0 > 9) | (h1 > 9) | (mi0 > 9) | (mi1 > 9) |
+            (s0 > 9) | (s1 > 9)) {
+            return false;
+        }
+
+        int year = static_cast<int>(y0 * 1000 + y1 * 100 + y2 * 10 + y3);
+        int month = static_cast<int>(m0 * 10 + m1);
+        int day = static_cast<int>(d0 * 10 + d1);
+        int hour = static_cast<int>(h0 * 10 + h1);
+        int minute = static_cast<int>(mi0 * 10 + mi1);
+        int second = static_cast<int>(s0 * 10 + s1);
+
+        if ((month < 1) | (month > 12) | (day < 1) | (hour > 23) | (minute > 59) | (second > 59)) return false;
 
         int64_t days;
         unsigned int y_idx = static_cast<unsigned int>(year - TUNABLE_CAL_BASE_YEAR);
@@ -190,6 +239,26 @@ inline bool parse_price_cents(std::string_view sv, int32_t& out_price) {
     return true;
 }
 
+// Fast-path integer ID parser for "p1".."p50000" and "c_1".."c_2000" (rejects leading zeros like "p01")
+inline bool try_parse_prefixed_uint(std::string_view sv, const char* prefix, size_t prefix_len, uint32_t max_val, uint32_t& out_id) {
+    size_t len = sv.size();
+    if (len <= prefix_len || len > prefix_len + 6) return false;
+    const char* s = sv.data();
+    for (size_t i = 0; i < prefix_len; ++i) {
+        if (s[i] != prefix[i]) return false;
+    }
+    if (s[prefix_len] < '1' || s[prefix_len] > '9') return false;
+    uint32_t v = static_cast<uint32_t>(s[prefix_len] - '0');
+    for (size_t i = prefix_len + 1; i < len; ++i) {
+        unsigned int d = static_cast<unsigned int>(static_cast<unsigned char>(s[i]) - '0');
+        if (d > 9) return false;
+        v = v * 10 + d;
+    }
+    if (v > max_val) return false;
+    out_id = v;
+    return true;
+}
+
 template <size_t K>
 inline bool parse_csv_line(std::string_view line, std::array<std::string_view, K>& fields) {
     if (line.empty()) return false;
@@ -226,7 +295,6 @@ inline bool parse_csv_line(std::string_view line, std::array<std::string_view, K
     return true;
 }
 
-// Single-pass CSV + newline scanner: parses K fields directly from a chunk slice without pre-scanning via memchr('\n')!
 template <size_t K, typename Func>
 inline void for_each_csv_record_in_slice(std::string_view slice, Func&& cb) {
     const char* p = slice.data();
@@ -235,7 +303,7 @@ inline void for_each_csv_record_in_slice(std::string_view slice, Func&& cb) {
 
     while (p < end) {
         if (*p == '\n') {
-            ++p; // Empty line is malformed and dropped
+            ++p;
             continue;
         }
         bool ok = true;
@@ -289,7 +357,6 @@ inline void for_each_csv_record_in_slice(std::string_view slice, Func&& cb) {
         if (ok) {
             cb(fields);
         } else {
-            // Malformed line: fast-forward to the next '\n'
             if (p < end && *p == '\n') {
                 ++p;
             } else if (p < end) {

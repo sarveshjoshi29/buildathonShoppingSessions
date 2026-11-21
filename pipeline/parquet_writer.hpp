@@ -1,16 +1,17 @@
 #pragma once
 // ============================================================================
-// TUNABLE PARAMETERS
+// TUNABLE PARAMETERS (Must remain at the start of the file per AGENTS.md)
 // ============================================================================
 #include <cstddef>
+#include <cstdint>
 
 namespace parquet {
-constexpr size_t TUNABLE_USER_ID_AVG_RESERVE = 12;
+constexpr size_t TUNABLE_USER_ID_MAX_BYTES_PER_ROW = 13; // 4-byte length + up to 9-byte unpacked PackedId64
+constexpr size_t TUNABLE_TOP_CAT_AVG_BYTES_PER_ROW = 16;
 constexpr size_t TUNABLE_CAMPAIGN_ID_AVG_RESERVE = 10;
 } // namespace parquet
 // ============================================================================
 
-#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
@@ -128,14 +129,15 @@ inline std::vector<uint8_t> make_page_header(int32_t uncompressed_size, int32_t 
     return tw.buf;
 }
 
+// Compact 32-byte UserDailyRow (down from 64 bytes: stores 8-byte PackedId64 user_id directly in the row!)
 struct UserDailyRow {
-    std::string_view user_id;
-    int32_t day;
-    int64_t sessions;
-    int64_t events;
-    int64_t revenue_cents;
-    std::string_view top_category;
-    bool has_top_category;
+    uint64_t user_id;      // 8B: PackedId64 (unpacked directly in CPU registers, zero external pointers!)
+    int64_t revenue_cents; // 8B
+    int32_t day;           // 4B
+    int32_t sessions;      // 4B
+    int32_t events;        // 4B
+    int16_t top_cat_idx;   // 2B: -1 if NULL, otherwise index into category_names
+    uint16_t pad;          // 2B -> Total = 32 bytes
 };
 
 struct CampaignDailyRow {
@@ -243,7 +245,11 @@ inline void write_parquet_file(
     out.write("PAR1", 4);
 }
 
-inline void write_user_daily_parquet(const std::string& path, const std::vector<UserDailyRow>& rows) {
+inline void write_user_daily_parquet(
+    const std::string& path,
+    const std::vector<UserDailyRow>& rows,
+    const std::vector<std::string>& category_names
+) {
     std::vector<ColSpec> specs = {
         {"user_id", ColType::BYTE_ARRAY, false, 0},
         {"day", ColType::INT32, false, 6},
@@ -257,12 +263,13 @@ inline void write_user_daily_parquet(const std::string& path, const std::vector<
     std::vector<std::vector<uint8_t>> payloads(6);
 
     if (n > 0) {
-        payloads[0].reserve(n * TUNABLE_USER_ID_AVG_RESERVE);
-        payloads[1].resize(n * 4);
-        payloads[2].resize(n * 8);
-        payloads[3].resize(n * 8);
-        payloads[4].resize(n * 8);
+        payloads[0].resize(static_cast<size_t>(n) * TUNABLE_USER_ID_MAX_BYTES_PER_ROW);
+        payloads[1].resize(static_cast<size_t>(n) * 4);
+        payloads[2].resize(static_cast<size_t>(n) * 8);
+        payloads[3].resize(static_cast<size_t>(n) * 8);
+        payloads[4].resize(static_cast<size_t>(n) * 8);
 
+        uint8_t* p_uid = payloads[0].data();
         int32_t* p_day = reinterpret_cast<int32_t*>(payloads[1].data());
         int64_t* p_sess = reinterpret_cast<int64_t*>(payloads[2].data());
         int64_t* p_ev = reinterpret_cast<int64_t*>(payloads[3].data());
@@ -270,34 +277,56 @@ inline void write_user_daily_parquet(const std::string& path, const std::vector<
 
         size_t num_groups = (rows.size() + 7) / 8;
         std::vector<uint8_t> def_bits(num_groups, 0);
+        size_t top_cat_total_bytes = 0;
 
         for (size_t i = 0; i < rows.size(); ++i) {
             const auto& r = rows[i];
-            append_u32_le(payloads[0], static_cast<uint32_t>(r.user_id.size()));
-            payloads[0].insert(payloads[0].end(), r.user_id.begin(), r.user_id.end());
+
+            // Unpack 63-bit PackedId64 directly in CPU registers into pre-sized buffer
+            uint64_t uid = r.user_id;
+            uint32_t ulen = 0;
+            uint8_t* str_dst = p_uid + 4;
+            for (int shift = 56; shift >= 0; shift -= 7) {
+                uint8_t c = static_cast<uint8_t>((uid >> shift) & 0x7Fu);
+                if (c == 0) break;
+                str_dst[ulen++] = c;
+            }
+            std::memcpy(p_uid, &ulen, 4);
+            p_uid += 4 + ulen;
 
             p_day[i] = r.day;
-            p_sess[i] = r.sessions;
-            p_ev[i] = r.events;
+            p_sess[i] = static_cast<int64_t>(r.sessions);
+            p_ev[i] = static_cast<int64_t>(r.events);
             p_rev[i] = r.revenue_cents;
 
-            if (r.has_top_category) {
+            if (r.top_cat_idx >= 0) {
                 def_bits[i >> 3] |= static_cast<uint8_t>(1u << (i & 7));
+                top_cat_total_bytes += 4 + category_names[static_cast<size_t>(r.top_cat_idx)].size();
             }
         }
+        payloads[0].resize(static_cast<size_t>(p_uid - payloads[0].data()));
 
         ThriftWriter rle_hdr;
         rle_hdr.write_varint((static_cast<uint64_t>(num_groups) << 1) | 1ULL);
         uint32_t rle_len = static_cast<uint32_t>(rle_hdr.buf.size() + def_bits.size());
-        append_u32_le(payloads[5], rle_len);
-        payloads[5].insert(payloads[5].end(), rle_hdr.buf.begin(), rle_hdr.buf.end());
-        payloads[5].insert(payloads[5].end(), def_bits.begin(), def_bits.end());
+
+        payloads[5].resize(4 + rle_len + top_cat_total_bytes);
+        uint8_t* p_tc = payloads[5].data();
+        std::memcpy(p_tc, &rle_len, 4);
+        p_tc += 4;
+        std::memcpy(p_tc, rle_hdr.buf.data(), rle_hdr.buf.size());
+        p_tc += rle_hdr.buf.size();
+        std::memcpy(p_tc, def_bits.data(), def_bits.size());
+        p_tc += def_bits.size();
 
         for (size_t i = 0; i < rows.size(); ++i) {
-            if (rows[i].has_top_category) {
-                const auto& tc = rows[i].top_category;
-                append_u32_le(payloads[5], static_cast<uint32_t>(tc.size()));
-                payloads[5].insert(payloads[5].end(), tc.begin(), tc.end());
+            int16_t cidx = rows[i].top_cat_idx;
+            if (cidx >= 0) {
+                const std::string& tc = category_names[static_cast<size_t>(cidx)];
+                uint32_t tclen = static_cast<uint32_t>(tc.size());
+                std::memcpy(p_tc, &tclen, 4);
+                std::memcpy(p_tc + 4, tc.data(), tclen);
+                p_tc += 4 + tclen;
             }
         }
     }
@@ -320,13 +349,13 @@ inline void write_campaign_daily_parquet(const std::string& path, const std::vec
     std::vector<std::vector<uint8_t>> payloads(7);
 
     if (n > 0) {
-        payloads[0].reserve(n * TUNABLE_CAMPAIGN_ID_AVG_RESERVE);
-        payloads[1].reserve(n * TUNABLE_CAMPAIGN_ID_AVG_RESERVE);
-        payloads[2].resize(n * 4);
-        payloads[3].resize(n * 8);
-        payloads[4].resize(n * 8);
-        payloads[5].resize(n * 8);
-        payloads[6].resize(n * 8);
+        payloads[0].reserve(static_cast<size_t>(n) * TUNABLE_CAMPAIGN_ID_AVG_RESERVE);
+        payloads[1].reserve(static_cast<size_t>(n) * TUNABLE_CAMPAIGN_ID_AVG_RESERVE);
+        payloads[2].resize(static_cast<size_t>(n) * 4);
+        payloads[3].resize(static_cast<size_t>(n) * 8);
+        payloads[4].resize(static_cast<size_t>(n) * 8);
+        payloads[5].resize(static_cast<size_t>(n) * 8);
+        payloads[6].resize(static_cast<size_t>(n) * 8);
 
         int32_t* p_day = reinterpret_cast<int32_t*>(payloads[2].data());
         int64_t* p_sess = reinterpret_cast<int64_t*>(payloads[3].data());
