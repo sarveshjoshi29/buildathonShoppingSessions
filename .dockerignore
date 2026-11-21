@@ -1,5 +1,11 @@
 fixtures/
 dev/
+dev-answer/
+generator/
+benchmarks/
+logs/
 out/
+*.zip
+*.exe
 *.md
 .git

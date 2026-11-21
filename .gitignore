@@ -4,4 +4,7 @@ dev/
 dev-answer/
 generator/
 out/
+benchmarks/
+logs/
 __pycache__/
+AGENTS.md

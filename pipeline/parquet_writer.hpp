@@ -1,4 +1,15 @@
 #pragma once
+// ============================================================================
+// TUNABLE PARAMETERS
+// ============================================================================
+#include <cstddef>
+
+namespace parquet {
+constexpr size_t TUNABLE_USER_ID_AVG_RESERVE = 12;
+constexpr size_t TUNABLE_CAMPAIGN_ID_AVG_RESERVE = 10;
+} // namespace parquet
+// ============================================================================
+
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -168,15 +179,12 @@ inline void write_parquet_file(
         }
     }
 
-    // Build FileMetaData
     ThriftWriter fw;
     int16_t fprev = 0;
     fw.write_i32_field(1, fprev, 1); // version = 1
 
-    // schema: 1 root + specs.size() leaves
     fw.write_list_header(2, fprev, 12, specs.size() + 1);
     {
-        // root schema element
         int16_t sprev = 0;
         fw.write_string_field(4, sprev, "schema");
         fw.write_i32_field(5, sprev, static_cast<int32_t>(specs.size()));
@@ -185,7 +193,7 @@ inline void write_parquet_file(
     for (const auto& s : specs) {
         int16_t sprev = 0;
         fw.write_i32_field(1, sprev, static_cast<int32_t>(s.type));
-        fw.write_i32_field(3, sprev, s.optional ? 1 : 0); // 0=REQUIRED, 1=OPTIONAL
+        fw.write_i32_field(3, sprev, s.optional ? 1 : 0);
         fw.write_string_field(4, sprev, s.name);
         if (s.converted_type >= 0) {
             fw.write_i32_field(6, sprev, s.converted_type);
@@ -193,28 +201,27 @@ inline void write_parquet_file(
         fw.write_struct_end();
     }
 
-    fw.write_i64_field(3, fprev, num_rows); // num_rows
+    fw.write_i64_field(3, fprev, num_rows);
 
-    // row_groups
     size_t num_rg = (num_rows > 0) ? 1 : 0;
     fw.write_list_header(4, fprev, 12, num_rg);
     if (num_rows > 0) {
         int16_t rg_prev = 0;
-        fw.write_list_header(1, rg_prev, 12, specs.size()); // columns
+        fw.write_list_header(1, rg_prev, 12, specs.size());
         for (size_t i = 0; i < specs.size(); ++i) {
             int16_t cc_prev = 0;
             fw.write_i64_field(2, cc_prev, chunks[i].file_offset);
-            fw.write_struct_begin(3, cc_prev); // ColumnMetaData
+            fw.write_struct_begin(3, cc_prev);
             {
                 int16_t cm_prev = 0;
                 fw.write_i32_field(1, cm_prev, static_cast<int32_t>(specs[i].type));
-                fw.write_list_header(2, cm_prev, 5, 2); // encodings: PLAIN(0), RLE(3)
+                fw.write_list_header(2, cm_prev, 5, 2);
                 fw.write_zigzag(0);
                 fw.write_zigzag(3);
-                fw.write_list_header(3, cm_prev, 8, 1); // path_in_schema
+                fw.write_list_header(3, cm_prev, 8, 1);
                 fw.write_varint(specs[i].name.size());
                 fw.buf.insert(fw.buf.end(), specs[i].name.begin(), specs[i].name.end());
-                fw.write_i32_field(4, cm_prev, 0); // CompressionCodec::UNCOMPRESSED = 0
+                fw.write_i32_field(4, cm_prev, 0);
                 fw.write_i64_field(5, cm_prev, num_rows);
                 fw.write_i64_field(6, cm_prev, chunks[i].total_size);
                 fw.write_i64_field(7, cm_prev, chunks[i].total_size);
@@ -228,7 +235,7 @@ inline void write_parquet_file(
         fw.write_struct_end();
     }
 
-    fw.write_struct_end(); // end FileMetaData
+    fw.write_struct_end();
 
     out.write(reinterpret_cast<const char*>(fw.buf.data()), fw.buf.size());
     uint32_t footer_len = static_cast<uint32_t>(fw.buf.size());
@@ -250,7 +257,7 @@ inline void write_user_daily_parquet(const std::string& path, const std::vector<
     std::vector<std::vector<uint8_t>> payloads(6);
 
     if (n > 0) {
-        payloads[0].reserve(n * 12);
+        payloads[0].reserve(n * TUNABLE_USER_ID_AVG_RESERVE);
         payloads[1].resize(n * 4);
         payloads[2].resize(n * 8);
         payloads[3].resize(n * 8);
@@ -261,7 +268,6 @@ inline void write_user_daily_parquet(const std::string& path, const std::vector<
         int64_t* p_ev = reinterpret_cast<int64_t*>(payloads[3].data());
         int64_t* p_rev = reinterpret_cast<int64_t*>(payloads[4].data());
 
-        // Optional top_category: RLE/bit-packed definition levels (bit-width = 1)
         size_t num_groups = (rows.size() + 7) / 8;
         std::vector<uint8_t> def_bits(num_groups, 0);
 
@@ -280,7 +286,6 @@ inline void write_user_daily_parquet(const std::string& path, const std::vector<
             }
         }
 
-        // Build RLE definition level block for payloads[5]
         ThriftWriter rle_hdr;
         rle_hdr.write_varint((static_cast<uint64_t>(num_groups) << 1) | 1ULL);
         uint32_t rle_len = static_cast<uint32_t>(rle_hdr.buf.size() + def_bits.size());
@@ -315,8 +320,8 @@ inline void write_campaign_daily_parquet(const std::string& path, const std::vec
     std::vector<std::vector<uint8_t>> payloads(7);
 
     if (n > 0) {
-        payloads[0].reserve(n * 10);
-        payloads[1].reserve(n * 10);
+        payloads[0].reserve(n * TUNABLE_CAMPAIGN_ID_AVG_RESERVE);
+        payloads[1].reserve(n * TUNABLE_CAMPAIGN_ID_AVG_RESERVE);
         payloads[2].resize(n * 4);
         payloads[3].resize(n * 8);
         payloads[4].resize(n * 8);
