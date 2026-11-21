@@ -1,14 +1,16 @@
 # Shopping Sessions: C++ high-performance pipeline.
 # Multi-stage build for linux/amd64 (Intel Xeon Cascade Lake+ scorers).
-FROM debian:bookworm-slim AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
+# gcc 15 builder: ~5% less CPU than bookworm's gcc 12 on this code (measured). Same Debian
+# release (bookworm, glibc 2.36) as the runtime image; libstdc++/libgcc are linked statically
+# because the runtime image only ships gcc 12's libstdc++.
+FROM gcc:15.2.0-bookworm AS builder
 
 WORKDIR /build
 COPY pipeline/ /build/pipeline/
-RUN g++ -std=c++20 -O3 -march=x86-64-v3 -pthread /build/pipeline/pipeline.cpp -o /build/pipeline_bin
+# -mtune=cascadelake: scorer is GCP N2 Cascade Lake (probe-measured); instruction set stays x86-64-v3
+RUN g++ -std=c++20 -O3 -march=x86-64-v3 -mtune=cascadelake -pthread \
+    -static-libstdc++ -static-libgcc \
+    /build/pipeline/pipeline.cpp -o /build/pipeline_bin
 
 FROM debian:bookworm-slim
 

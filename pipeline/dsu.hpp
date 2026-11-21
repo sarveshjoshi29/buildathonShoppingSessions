@@ -163,8 +163,8 @@ struct LinkPair {
 // Only non-canonical users are stored; everyone else resolves to themselves.
 // The table is split into 2^REGION_BITS regions by the top hash bits; inside a region the
 // home slot is fastrange(hash) over the region's exact (non power-of-2) capacity.
-// Lookups are latency-bound (the table is larger than L3), so callers resolve in batches:
-// prefetch(hash_id64(id[i + D])) and then resolve(id[i], hash_id64(id[i])).
+// Lookups are latency-bound (the table is larger than L2), so the pipeline resolves each
+// distinct id once per shard (Stage 3b) rather than once per record.
 class LinkResolver {
 public:
     LinkResolver() {
@@ -339,13 +339,6 @@ public:
                 base[pos].canon_id = canon;
             }
         });
-    }
-
-    // Starts loading the home slot of the id whose hash_id64 is h. Never blocks.
-    void prefetch(uint64_t h) const {
-        size_t r = static_cast<size_t>(h >> kRegionShift);
-        uint64_t cap = region_cap_[r];
-        if (cap != 0) __builtin_prefetch(table_ + region_off_[r] + home(h, cap));
     }
 
     // Canonical id of uid; h must be hash_id64(uid). An id absent from the table is its own name.
