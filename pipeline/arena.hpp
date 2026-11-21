@@ -41,6 +41,14 @@ public:
         init(bytes);
     }
 
+    // Makes the arena hand out [base, base + bytes): memory owned by someone else that is
+    // already faulted in (e.g. the free tail of a dead buffer). The arena never releases it.
+    void adopt(void* base, size_t bytes) {
+        base_ = static_cast<char*>(base);
+        cap_ = bytes;
+        used_ = 0;
+    }
+
 private:
     // Reserves address space for `bytes`; pages are committed on first touch.
     void init(size_t bytes) {

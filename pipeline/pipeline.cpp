@@ -15,13 +15,15 @@ constexpr size_t TUNABLE_AVG_CLICK_ROW_BYTES = 42;
 constexpr size_t TUNABLE_MIN_HASH_CAP = 64;
 constexpr uint32_t TUNABLE_FAST_PRODUCT_MAX_ID = 100000;
 constexpr uint32_t TUNABLE_FAST_CAMPAIGN_MAX_ID = 10000;
-constexpr size_t TUNABLE_RESERVE_SLACK_PCT = 130;            // shard vector reserve = estimate * 1.3 + 64 (avoids regrowth)
+constexpr size_t TUNABLE_RESERVE_SLACK_PCT = 100;            // shard vector reserve = estimate * 1.0 + 64; less untouched slack = less kernel page zeroing (ShardWriter regrows on overflow)
 constexpr size_t TUNABLE_INSERTION_SORT_MAX = 32;            // per-user event sort: insertion sort up to this size
 constexpr size_t TUNABLE_ARENA_SLACK_PCT = 150;               // per-thread huge-page arena = shard reserves * 1.5 (room to regrow)
 constexpr uint32_t TUNABLE_DEDUP_PREFETCH_DIST = 16;         // dedup hash table: prefetch the home slot this many records ahead
 constexpr size_t TUNABLE_FORWARD_PCT = 50;                  // Stage 3b buffer reserve: share of records expected to move (measured ~40% on 20M)
 constexpr size_t TUNABLE_DISTINCT_ID_DIV = 16;              // Stage 3b id map sized for records/16 distinct ids (20M: ~16 records per id); grows if needed
 constexpr size_t TUNABLE_RESOLVE_PREFETCH_DIST = 16;        // Stage 3b batch resolve: prefetch the link-table slot this many distinct ids ahead
+constexpr size_t TUNABLE_SPAN_PREFETCH_DIST = 4;            // survivor spans: prefetch this many spans ahead (Stage 3b, Stage 4)
+constexpr size_t TUNABLE_SPAN_PREFETCH_BYTES = 512;          // survivor spans: bytes prefetched from the start of a span
 constexpr size_t TUNABLE_RADIX_SORT_MIN = 128;               // per-user event sort: 4-pass 32-bit LSD radix sort from this size
 } // namespace
 // ============================================================================
@@ -34,6 +36,7 @@ constexpr size_t TUNABLE_RADIX_SORT_MIN = 128;               // per-user event s
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -282,6 +285,31 @@ void append_shards_to_arena(std::vector<Shard>& shards, HugeArena& arena, size_t
 
 // Gives each of a worker's shard vectors `per_shard` reserved elements carved from one
 // per-thread huge-page arena (one page fault per 2 MiB instead of per 4 KiB).
+// Gives shard vector i `per_shard` reserved elements carved from tails[i] (vector and its
+// regrowth stay in that arena while it has room, then fall back to the heap).
+template <typename Shard>
+void reserve_shards_in_tails(std::vector<Shard>& shards, HugeArena* tails, size_t per_shard) {
+    using T = typename Shard::value_type;
+    for (size_t i = 0; i < shards.size(); ++i) {
+        shards[i] = Shard(ArenaAllocator<T>(&tails[i]));
+        shards[i].reserve(per_shard);
+    }
+}
+
+// A run of survivors inside a raw event block (Stage 2 output, compacted by Stage 3b).
+struct SurvSpan {
+    SurvivingEventRecord* p = nullptr;
+    uint32_t n = 0;
+};
+
+// Starts loading the first cache lines of a span (spans are short and scattered, so the
+// hardware prefetcher restarts at every one).
+inline void prefetch_span(const SurvSpan& sp) {
+    const char* c = reinterpret_cast<const char*>(sp.p);
+    const size_t bytes = static_cast<size_t>(sp.n) * sizeof(SurvivingEventRecord);
+    for (size_t off = 0; off < bytes && off < TUNABLE_SPAN_PREFETCH_BYTES; off += 64) __builtin_prefetch(c + off);
+}
+
 template <typename Shard>
 void reserve_shards_in_arena(std::vector<Shard>& shards, HugeArena& arena, size_t per_shard) {
     using T = typename Shard::value_type;
@@ -338,6 +366,16 @@ struct CampaignAgg {
     int64_t purchasing_sessions = 0;
     int64_t revenue_cents = 0;
     int64_t assisted_sessions = 0;
+};
+
+// One worker's cell of the campaign x day grid (24 bytes instead of 32: the grid is updated at
+// random per session, so its size decides how much of it stays in L2). Counts within one worker
+// fit 32 bits (at most one per session); the merge adds them into CampaignAgg's 64-bit fields.
+struct CampaignCell {
+    int64_t revenue_cents = 0;
+    uint32_t sessions = 0;
+    uint32_t purchasing_sessions = 0;
+    uint32_t assisted_sessions = 0;
 };
 
 std::vector<std::string> list_csv_files(const fs::path& dir) {
@@ -656,19 +694,23 @@ int main(int argc, char** argv) {
     }
 
     // Stage 2: Parallel Deduplication
+    // Survivors are written in place into the raw block they come from (16-byte records into a
+    // 32-byte-record buffer that is already faulted in), grouped by the person shard of their RAW
+    // user id. Block b = rt * NUM_SHARDS + event shard; surv_spans[sh * num_blocks + b] is block
+    // b's run of survivors for person shard sh. Fresh memory would cost a kernel page zeroing.
     STAGE_MARK("Stage2_Events_Dedup");
-    std::vector<std::vector<SurvivingEventShard>> thread_person_ev_shards(
-        num_threads, std::vector<SurvivingEventShard>(TUNABLE_NUM_SHARDS));
-    std::unique_ptr<HugeArena[]> surv_arenas(new HugeArena[num_threads]);
+    static_assert(TUNABLE_NUM_SHARDS <= 256, "survivor shard index is stored in one byte");
+    const size_t num_blocks = static_cast<size_t>(num_threads) * TUNABLE_NUM_SHARDS;
+    std::vector<SurvSpan> surv_spans(TUNABLE_NUM_SHARDS * num_blocks);
+    std::vector<size_t> block_surv_bytes(num_blocks, 0);
     {
         std::atomic<size_t> next_shard{0};
         std::vector<std::thread> workers;
         workers.reserve(num_threads);
         for (unsigned int t = 0; t < num_threads; ++t) {
             workers.emplace_back([&, t]() {
-                auto& my_out = thread_person_ev_shards[t];
-                reserve_shards_in_arena(my_out, surv_arenas[t], est_recs_per_thread_shard);
-                ShardWriter<SurvivingEventShard> out(my_out);
+                std::vector<SurvivingEventRecord> part_recs;   // one block's survivors, before grouping
+                std::vector<uint8_t> part_dest;                // their person shards
 
                 // Packed 8-byte slot: bit 63 = occupied (1), bits 32..62 = 31-bit event_id tag,
                 // bits 24..31 = thread_idx, bits 0..23 = rec_idx. Empty slot = 0ULL.
@@ -726,20 +768,43 @@ int main(int argc, char** argv) {
                         }
                     }
 
-                    // Survivors go to the shard of their RAW user id; Stage 3b resolves each
-                    // distinct id once and forwards the events of non-canonical ids.
+                    // Survivors are grouped by the person shard of their RAW user id; Stage 3b
+                    // resolves each distinct id once and forwards the events of non-canonical ids.
+                    // Dedup of this event shard is complete, so each raw block is read once more
+                    // and then overwritten with its own grouped survivors.
                     for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        const auto& recs = thread_ev_shards[rt][s_id];
-                        for (const auto& rec : recs) {
+                        auto& recs = thread_ev_shards[rt][s_id];
+                        const size_t n_recs = recs.size();
+                        if (part_recs.size() < n_recs) {
+                            part_recs.resize(n_recs);
+                            part_dest.resize(n_recs);
+                        }
+                        uint32_t cnt[TUNABLE_NUM_SHARDS] = {};
+                        size_t m = 0;
+                        for (size_t i = 0; i < n_recs; ++i) {
+                            const auto& rec = recs[i];
                             if ((rec.price_cat_valid & 0x80000000u) == 0) continue;
-                            size_t u_shard = static_cast<size_t>(hash_id64(rec.user_id) & SHARD_MASK);
+                            const uint8_t u_shard = static_cast<uint8_t>(hash_id64(rec.user_id) & SHARD_MASK);
                             uint64_t packed_ev = (static_cast<uint64_t>(rec.rel_ts) << 32) |
                                                  static_cast<uint64_t>(rec.price_cat_valid & 0x7FFFFFFFu);
-                            out.push(u_shard, SurvivingEventRecord{
-                                rec.user_id,
-                                packed_ev
-                            });
+                            part_recs[m] = SurvivingEventRecord{rec.user_id, packed_ev};
+                            part_dest[m] = u_shard;
+                            ++cnt[u_shard];
+                            ++m;
                         }
+                        const size_t b = static_cast<size_t>(rt) * TUNABLE_NUM_SHARDS + s_id;
+                        SurvivingEventRecord* base = reinterpret_cast<SurvivingEventRecord*>(recs.data());
+                        uint32_t pos[TUNABLE_NUM_SHARDS];
+                        uint32_t run = 0;
+                        for (size_t sh = 0; sh < TUNABLE_NUM_SHARDS; ++sh) {
+                            pos[sh] = run;
+                            surv_spans[sh * num_blocks + b] = SurvSpan{base + run, cnt[sh]};
+                            run += cnt[sh];
+                        }
+                        for (size_t i = 0; i < m; ++i) {
+                            std::memcpy(base + pos[part_dest[i]]++, &part_recs[i], sizeof(SurvivingEventRecord));
+                        }
+                        block_surv_bytes[b] = m * sizeof(SurvivingEventRecord);
                     }
                 }
             });
@@ -755,9 +820,19 @@ int main(int argc, char** argv) {
 
     std::vector<std::vector<ValidClickShard>> thread_person_click_shards(
         num_threads, std::vector<ValidClickShard>(TUNABLE_NUM_SHARDS));
-    // Raw event shards are dead after dedup: their already-faulted arenas hold the clicks.
-    thread_ev_shards.clear();
-    std::unique_ptr<HugeArena[]> click_arenas = std::move(ev_arenas);
+    // Each raw block is now half used by its survivors; the free tail is already faulted in and
+    // holds this thread's click buffer for the same shard index, then its Stage 3b forwarding
+    // buffers. thread_ev_shards stays alive: it owns the blocks (heap fallbacks included).
+    std::unique_ptr<HugeArena[]> tail_arenas(new HugeArena[num_blocks]);
+    for (unsigned int rt = 0; rt < num_threads; ++rt) {
+        for (size_t s = 0; s < TUNABLE_NUM_SHARDS; ++s) {
+            const size_t b = static_cast<size_t>(rt) * TUNABLE_NUM_SHARDS + s;
+            auto& raw = thread_ev_shards[rt][s];
+            const size_t used = (block_surv_bytes[b] + 63) & ~size_t{63};
+            const size_t cap = raw.capacity() * sizeof(RawEventRecord);
+            if (cap > used) tail_arenas[b].adopt(reinterpret_cast<char*>(raw.data()) + used, cap - used);
+        }
+    }
     {
         std::atomic<size_t> next_chunk{0};
         std::vector<std::thread> workers;
@@ -765,7 +840,7 @@ int main(int argc, char** argv) {
         for (unsigned int t = 0; t < num_threads; ++t) {
             workers.emplace_back([&, t]() {
                 auto& my_out = thread_person_click_shards[t];
-                reserve_shards_in_arena(my_out, click_arenas[t], est_clicks_per_thread_shard);
+                reserve_shards_in_tails(my_out, &tail_arenas[static_cast<size_t>(t) * TUNABLE_NUM_SHARDS], est_clicks_per_thread_shard);
                 ShardWriter<ValidClickShard> out(my_out);
                 CsvChunkReader reader;
 
@@ -808,11 +883,9 @@ int main(int argc, char** argv) {
         num_threads, std::vector<ValidClickShard>(TUNABLE_NUM_SHARDS));
     {
         size_t total_surv = 0, total_clicks = 0;
+        for (size_t b = 0; b < num_blocks; ++b) total_surv += block_surv_bytes[b] / sizeof(SurvivingEventRecord);
         for (unsigned int rt = 0; rt < num_threads; ++rt) {
-            for (size_t sh = 0; sh < TUNABLE_NUM_SHARDS; ++sh) {
-                total_surv += thread_person_ev_shards[rt][sh].size();
-                total_clicks += thread_person_click_shards[rt][sh].size();
-            }
+            for (size_t sh = 0; sh < TUNABLE_NUM_SHARDS; ++sh) total_clicks += thread_person_click_shards[rt][sh].size();
         }
         const size_t per_shard_div = static_cast<size_t>(num_threads) * TUNABLE_NUM_SHARDS;
         const size_t est_fwd_ev = reserve_with_slack(total_surv * TUNABLE_FORWARD_PCT / 100 / per_shard_div);
@@ -825,10 +898,11 @@ int main(int argc, char** argv) {
             workers.emplace_back([&, t]() {
                 auto& fwd_ev = thread_fwd_ev_shards[t];
                 auto& fwd_clk = thread_fwd_click_shards[t];
-                // The Stage 1 arenas (now holding only the clicks) are mostly free and already
-                // faulted in: forwarding buffers go after the click shards, no new page faults.
-                append_shards_to_arena(fwd_ev, click_arenas[t], est_fwd_ev);
-                append_shards_to_arena(fwd_clk, click_arenas[t], est_fwd_clk);
+                // Forwarding buffers go after the click buffers in the raw blocks' free tails
+                // (already faulted in: no new page faults).
+                HugeArena* my_tails = &tail_arenas[static_cast<size_t>(t) * TUNABLE_NUM_SHARDS];
+                reserve_shards_in_tails(fwd_ev, my_tails, est_fwd_ev);
+                reserve_shards_in_tails(fwd_clk, my_tails, est_fwd_clk);
                 ShardWriter<SurvivingEventShard> fwd_ev_out(fwd_ev);
                 ShardWriter<ValidClickShard> fwd_clk_out(fwd_clk);
 
@@ -841,10 +915,10 @@ int main(int argc, char** argv) {
                 while (true) {
                     size_t sh = next_shard.fetch_add(1, std::memory_order_relaxed);
                     if (sh >= TUNABLE_NUM_SHARDS) break;
+                    SurvSpan* const spans = &surv_spans[sh * num_blocks];
                     size_t n_recs = 0;
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        n_recs += thread_person_ev_shards[rt][sh].size() + thread_person_click_shards[rt][sh].size();
-                    }
+                    for (size_t b = 0; b < num_blocks; ++b) n_recs += spans[b].n;
+                    for (unsigned int rt = 0; rt < num_threads; ++rt) n_recs += thread_person_click_shards[rt][sh].size();
                     if (n_recs == 0) continue;
                     id_map.reset(n_recs / TUNABLE_DISTINCT_ID_DIV + 16);
                     if (rec_k.size() < n_recs) rec_k.resize(n_recs);
@@ -852,8 +926,10 @@ int main(int argc, char** argv) {
                     // Pass 1: number the distinct raw ids (the id map stays in L2).
                     size_t ri = 0;
                     bool inserted = false;
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        for (const auto& rec : thread_person_ev_shards[rt][sh]) rec_k[ri++] = id_map.find_or_insert(rec.user_id, inserted);
+                    for (size_t b = 0; b < num_blocks; ++b) {
+                        if (b + TUNABLE_SPAN_PREFETCH_DIST < num_blocks) prefetch_span(spans[b + TUNABLE_SPAN_PREFETCH_DIST]);
+                        const SurvivingEventRecord* p = spans[b].p;
+                        for (uint32_t i = 0, n = spans[b].n; i < n; ++i) rec_k[ri++] = id_map.find_or_insert(p[i].user_id, inserted);
                     }
                     for (unsigned int rt = 0; rt < num_threads; ++rt) {
                         for (const auto& rec : thread_person_click_shards[rt][sh]) rec_k[ri++] = id_map.find_or_insert(rec.user_id, inserted);
@@ -875,10 +951,12 @@ int main(int argc, char** argv) {
 
                     // Pass 2: compact each source vector in place; canonical records stay, the rest move.
                     ri = 0;
-                    for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        auto& v = thread_person_ev_shards[rt][sh];
-                        size_t keep = 0;
-                        for (size_t i = 0; i < v.size(); ++i) {
+                    for (size_t b = 0; b < num_blocks; ++b) {
+                        if (b + TUNABLE_SPAN_PREFETCH_DIST < num_blocks) prefetch_span(spans[b + TUNABLE_SPAN_PREFETCH_DIST]);
+                        SurvivingEventRecord* v = spans[b].p;
+                        const uint32_t n = spans[b].n;
+                        uint32_t keep = 0;
+                        for (uint32_t i = 0; i < n; ++i) {
                             SurvivingEventRecord rec = v[i];
                             uint32_t k = rec_k[ri++];
                             uint16_t d = dest_of[k];
@@ -889,7 +967,7 @@ int main(int argc, char** argv) {
                                 fwd_ev_out.push(d, rec);
                             }
                         }
-                        v.resize(keep);
+                        spans[b].n = keep;
                     }
                     for (unsigned int rt = 0; rt < num_threads; ++rt) {
                         auto& v = thread_person_click_shards[rt][sh];
@@ -917,7 +995,7 @@ int main(int argc, char** argv) {
     STAGE_MARK("Stage4_Sessionize_Attrib");
     struct ThreadOutput {
         std::vector<parquet::UserDailyRow> user_rows;
-        std::vector<CampaignAgg> camp_grid;
+        std::vector<CampaignCell> camp_grid;
     };
     std::vector<ThreadOutput> thread_outputs(num_threads);
 
@@ -930,9 +1008,12 @@ int main(int argc, char** argv) {
             for (size_t sh = 0; sh < TUNABLE_NUM_SHARDS; ++sh) {
                 shard_order[sh] = static_cast<uint32_t>(sh);
                 for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                    shard_load[sh] += thread_person_ev_shards[rt][sh].size() + thread_person_click_shards[rt][sh].size() +
+                    shard_load[sh] += thread_person_click_shards[rt][sh].size() +
                                       thread_fwd_ev_shards[rt][sh].size() + thread_fwd_click_shards[rt][sh].size();
                 }
+            }
+            for (size_t sh = 0; sh < TUNABLE_NUM_SHARDS; ++sh) {
+                for (size_t b = 0; b < num_blocks; ++b) shard_load[sh] += surv_spans[sh * num_blocks + b].n;
             }
             std::stable_sort(shard_order.begin(), shard_order.end(),
                              [&](uint32_t a, uint32_t b) { return shard_load[a] > shard_load[b]; });
@@ -948,7 +1029,7 @@ int main(int argc, char** argv) {
         for (unsigned int t = 0; t < num_threads; ++t) {
             workers.emplace_back([&, t, num_cats]() {
                 auto& out = thread_outputs[t];
-                out.camp_grid.assign(num_campaigns * num_days, CampaignAgg{});
+                out.camp_grid.assign(num_campaigns * num_days, CampaignCell{});
 
                 std::vector<int64_t> day_cat_rev(num_cats, 0);
                 std::vector<int32_t> active_camp_count(num_campaigns, 0);
@@ -979,26 +1060,33 @@ int main(int argc, char** argv) {
                 std::vector<uint32_t> clk_write_pos;
                 std::vector<CompactClick> csr_clicks;
                 std::vector<uint64_t> sort_scratch;
-                // A person shard's records: [0, T) stayed in Stage 3b, [T, 2T) were forwarded to it.
+                // Click sources of a person shard: [0, T) stayed in Stage 3b, [T, 2T) were forwarded to it.
                 const unsigned int num_srcs = 2 * num_threads;
-                std::vector<const SurvivingEventShard*> ev_srcs(num_srcs);
+                // Event runs of a person shard: the non-empty survivor spans that stayed in Stage 3b,
+                // then the forwarded vectors.
+                std::vector<SurvSpan> ev_runs;
+                ev_runs.reserve(num_blocks + num_threads);
                 std::vector<const ValidClickShard*> clk_srcs(num_srcs);
 
                 while (true) {
                     size_t order_idx = next_p_shard.fetch_add(1, std::memory_order_relaxed);
                     if (order_idx >= TUNABLE_NUM_SHARDS) break;
                     size_t p_shard = shard_order[order_idx];
+                    ev_runs.clear();
+                    size_t total_evs = 0;
+                    for (size_t b = 0; b < num_blocks; ++b) {
+                        const SurvSpan& sp = surv_spans[p_shard * num_blocks + b];
+                        if (sp.n != 0) ev_runs.push_back(sp);
+                        total_evs += sp.n;
+                    }
                     for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        ev_srcs[rt] = &thread_person_ev_shards[rt][p_shard];
-                        ev_srcs[num_threads + rt] = &thread_fwd_ev_shards[rt][p_shard];
+                        auto& fv = thread_fwd_ev_shards[rt][p_shard];
+                        if (!fv.empty()) ev_runs.push_back(SurvSpan{fv.data(), static_cast<uint32_t>(fv.size())});
+                        total_evs += fv.size();
                         clk_srcs[rt] = &thread_person_click_shards[rt][p_shard];
                         clk_srcs[num_threads + rt] = &thread_fwd_click_shards[rt][p_shard];
                     }
 
-                    size_t total_evs = 0;
-                    for (unsigned int k = 0; k < num_srcs; ++k) {
-                        total_evs += ev_srcs[k]->size();
-                    }
                     if (total_evs == 0) continue;
 
                     person_map.reset(total_evs / 4 + 16);
@@ -1006,9 +1094,10 @@ int main(int argc, char** argv) {
                     ev_person_ids.reserve(total_evs);
                     person_ev_counts.clear();
 
-                    for (unsigned int k = 0; k < num_srcs; ++k) {
-                        const auto& recs = *ev_srcs[k];
-                        for (const auto& rec : recs) {
+                    for (size_t r = 0; r < ev_runs.size(); ++r) {
+                        if (r + TUNABLE_SPAN_PREFETCH_DIST < ev_runs.size()) prefetch_span(ev_runs[r + TUNABLE_SPAN_PREFETCH_DIST]);
+                        const SurvSpan& run = ev_runs[r];
+                        for (const SurvivingEventRecord& rec : std::span<const SurvivingEventRecord>(run.p, run.n)) {
                             bool inserted = false;
                             uint32_t pid = person_map.find_or_insert(rec.user_id, inserted);
                             if (inserted) {
@@ -1029,9 +1118,10 @@ int main(int argc, char** argv) {
                     csr_events.resize(total_evs);
 
                     size_t global_ei = 0;
-                    for (unsigned int k = 0; k < num_srcs; ++k) {
-                        const auto& recs = *ev_srcs[k];
-                        for (const auto& rec : recs) {
+                    for (size_t r = 0; r < ev_runs.size(); ++r) {
+                        if (r + TUNABLE_SPAN_PREFETCH_DIST < ev_runs.size()) prefetch_span(ev_runs[r + TUNABLE_SPAN_PREFETCH_DIST]);
+                        const SurvSpan& run = ev_runs[r];
+                        for (const SurvivingEventRecord& rec : std::span<const SurvivingEventRecord>(run.p, run.n)) {
                             uint32_t pid = ev_person_ids[global_ei++];
                             csr_events[write_pos[pid]++] = rec.packed_ev;
                         }
