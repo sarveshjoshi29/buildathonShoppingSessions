@@ -9,3 +9,4 @@ logs/
 __pycache__/
 AGENTS.md
 ASSUMPTIONS.md
+scripts/

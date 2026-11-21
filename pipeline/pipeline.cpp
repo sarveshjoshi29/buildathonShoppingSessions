@@ -5,8 +5,8 @@
 #include <cstdint>
 
 namespace {
-constexpr size_t TUNABLE_ZIPF_CHUNK_BYTES = 1 * 1024 * 1024; // 1 MB \n-aligned chunks for Zipf file load balancing
-constexpr size_t TUNABLE_NUM_SHARDS = 256;                   // Must be a power of 2
+constexpr size_t TUNABLE_READ_CHUNK_BYTES = 512 * 1024;     // pread() task size; a task ends on the first '\n' past its range
+constexpr size_t TUNABLE_NUM_SHARDS = 256;                   // Power of 2; WSL A/B: 256 = 1.50 s, 64 = 1.69 s, 512 = 1.79 s
 constexpr unsigned int TUNABLE_DEFAULT_THREADS = 8;
 constexpr int64_t TUNABLE_SESSION_GAP_MS = 1800000LL;        // 30 minutes
 constexpr int64_t TUNABLE_CLICK_LOOKBACK_MS = 604800000LL;   // 7 days
@@ -15,6 +15,12 @@ constexpr size_t TUNABLE_AVG_CLICK_ROW_BYTES = 42;
 constexpr size_t TUNABLE_MIN_HASH_CAP = 64;
 constexpr uint32_t TUNABLE_FAST_PRODUCT_MAX_ID = 100000;
 constexpr uint32_t TUNABLE_FAST_CAMPAIGN_MAX_ID = 10000;
+constexpr size_t TUNABLE_RESERVE_SLACK_PCT = 130;            // shard vector reserve = estimate * 1.3 + 64 (avoids regrowth)
+constexpr size_t TUNABLE_INSERTION_SORT_MAX = 32;            // per-user event sort: insertion sort up to this size
+constexpr size_t TUNABLE_ARENA_SLACK_PCT = 150;               // per-thread huge-page arena = shard reserves * 1.5 (room to regrow)
+constexpr uint32_t TUNABLE_DEDUP_PREFETCH_DIST = 16;         // dedup hash table: prefetch the home slot this many records ahead
+constexpr size_t TUNABLE_RESOLVE_PREFETCH_DIST = 16;        // user-id resolve: prefetch the table slot this many records ahead
+constexpr size_t TUNABLE_RADIX_SORT_MIN = 128;               // per-user event sort: 4-pass 32-bit LSD radix sort from this size
 } // namespace
 // ============================================================================
 
@@ -25,17 +31,47 @@ constexpr uint32_t TUNABLE_FAST_CAMPAIGN_MAX_ID = 10000;
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
 
+#include "arena.hpp"
 #include "dsu.hpp"
 #include "parquet_writer.hpp"
 #include "parser.hpp"
 
 namespace fs = std::filesystem;
 using namespace pipeline;
+
+// Stage boundary trace for profiling builds only (-DPIPELINE_STAGE_TRACE, Linux).
+// Prints "PIPELINE_STAGE <name> <CLOCK_MONOTONIC ns>" lines to stderr at exit so
+// perf samples (recorded with -k CLOCK_MONOTONIC) can be attributed to stages.
+// Release builds compile these macros to nothing.
+#ifdef PIPELINE_STAGE_TRACE
+#include <cstdio>
+#include <ctime>
+namespace {
+struct StageMark { const char* name; long long ns; };
+StageMark g_stage_marks[16];
+int g_stage_count = 0;
+inline void stage_mark(const char* name) {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (g_stage_count < 16) g_stage_marks[g_stage_count++] = {name, ts.tv_sec * 1000000000LL + ts.tv_nsec};
+}
+inline void stage_dump() {
+    for (int i = 0; i < g_stage_count; ++i)
+        std::fprintf(stderr, "PIPELINE_STAGE %s %lld\n", g_stage_marks[i].name, g_stage_marks[i].ns);
+}
+} // namespace
+#define STAGE_MARK(name) stage_mark(name)
+#define STAGE_DUMP() stage_dump()
+#else
+#define STAGE_MARK(name) ((void)0)
+#define STAGE_DUMP() ((void)0)
+#endif
 
 namespace {
 
@@ -208,7 +244,7 @@ struct PersonIdMap {
 
 struct RawEventRecord {
     uint64_t event_id;
-    uint64_t user_id;
+    uint64_t user_id;        // raw PackedId64 (0 if the record is invalid); resolved in Stage 2
     int32_t ingest_rel_sec;
     uint32_t rel_ts;
     uint32_t price_cat_valid;
@@ -226,6 +262,22 @@ struct ValidClickRecord {
     uint32_t click_rel_ts;
     uint32_t campaign_idx;
 };
+
+using RawEventShard = std::vector<RawEventRecord, ArenaAllocator<RawEventRecord>>;
+using SurvivingEventShard = std::vector<SurvivingEventRecord, ArenaAllocator<SurvivingEventRecord>>;
+using ValidClickShard = std::vector<ValidClickRecord, ArenaAllocator<ValidClickRecord>>;
+
+// Gives each of a worker's shard vectors `per_shard` reserved elements carved from one
+// per-thread huge-page arena (one page fault per 2 MiB instead of per 4 KiB).
+template <typename Shard>
+void reserve_shards_in_arena(std::vector<Shard>& shards, HugeArena& arena, size_t per_shard) {
+    using T = typename Shard::value_type;
+    arena.prepare(shards.size() * per_shard * sizeof(T) * TUNABLE_ARENA_SLACK_PCT / 100);
+    for (auto& s : shards) {
+        s = Shard(ArenaAllocator<T>(&arena));
+        s.reserve(per_shard);
+    }
+}
 
 struct CampaignAgg {
     int64_t sessions = 0;
@@ -246,29 +298,83 @@ std::vector<std::string> list_csv_files(const fs::path& dir) {
     return files;
 }
 
-std::vector<MappedFile> open_mapped_files_parallel(const std::vector<std::string>& paths, unsigned int num_threads) {
-    std::vector<MappedFile> files(paths.size());
-    if (paths.empty()) return files;
-    unsigned int nth = std::min<unsigned int>(num_threads, static_cast<unsigned int>(paths.size()));
-    std::atomic<size_t> next_idx{0};
-    std::vector<std::thread> workers;
-    workers.reserve(nth);
-    for (unsigned int t = 0; t < nth; ++t) {
-        workers.emplace_back([&]() {
-            while (true) {
-                size_t i = next_idx.fetch_add(1, std::memory_order_relaxed);
-                if (i >= paths.size()) break;
-                files[i].open(paths[i]);
-            }
-        });
+inline size_t reserve_with_slack(size_t est) {
+    return est * TUNABLE_RESERVE_SLACK_PCT / 100 + 64;
+}
+
+inline bool sv_eq4(std::string_view sv, const char (&lit)[5]) {
+    if (sv.size() != 4) return false;
+    uint32_t a, b;
+    std::memcpy(&a, sv.data(), 4);
+    std::memcpy(&b, lit, 4);
+    return a == b;
+}
+
+inline bool sv_eq8(std::string_view sv, const char (&lit)[9]) {
+    if (sv.size() != 8) return false;
+    uint64_t a, b;
+    std::memcpy(&a, sv.data(), 8);
+    std::memcpy(&b, lit, 8);
+    return a == b;
+}
+
+// Ascending sort of packed (rel_ts << 32 | meta) event words by upper 32-bit rel_ts.
+// Small: 2-elem / insertion sort. Large: 4-pass 8-bit LSD radix sort over rel_ts bytes (skips constant bytes).
+void sort_events_u64(uint64_t* a, size_t n, std::vector<uint64_t>& scratch) {
+    if (n == 2) {
+        if (a[0] > a[1]) std::swap(a[0], a[1]);
+        return;
     }
-    for (auto& w : workers) w.join();
-    return files;
+    if (n <= TUNABLE_INSERTION_SORT_MAX) {
+        for (size_t i = 1; i < n; ++i) {
+            uint64_t v = a[i];
+            size_t j = i;
+            while (j > 0 && a[j - 1] > v) {
+                a[j] = a[j - 1];
+                --j;
+            }
+            a[j] = v;
+        }
+        return;
+    }
+    if (n < TUNABLE_RADIX_SORT_MIN) {
+        std::sort(a, a + n);
+        return;
+    }
+    uint32_t hist[4][256] = {};
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t ts = static_cast<uint32_t>(a[i] >> 32);
+        hist[0][ts & 0xFFu]++;
+        hist[1][(ts >> 8) & 0xFFu]++;
+        hist[2][(ts >> 16) & 0xFFu]++;
+        hist[3][(ts >> 24) & 0xFFu]++;
+    }
+    scratch.resize(n);
+    uint64_t* src = a;
+    uint64_t* dst = scratch.data();
+    for (int b = 0; b < 4; ++b) {
+        uint32_t* h = hist[b];
+        unsigned int shift = static_cast<unsigned int>(32 + 8 * b);
+        if (h[(src[0] >> shift) & 0xFFu] == n) continue; // byte is constant across all keys
+        uint32_t sum = 0;
+        for (int k = 0; k < 256; ++k) {
+            uint32_t c = h[k];
+            h[k] = sum;
+            sum += c;
+        }
+        for (size_t i = 0; i < n; ++i) {
+            uint64_t v = src[i];
+            dst[h[(v >> shift) & 0xFFu]++] = v;
+        }
+        std::swap(src, dst);
+    }
+    if (src != a) std::memcpy(a, src, n * sizeof(uint64_t));
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
+    STAGE_MARK("Stage0_Lookups");
     std::string data_dir = "/data";
     std::string out_dir = "/output";
     if (const char* env_d = std::getenv("DATA_DIR")) data_dir = env_d;
@@ -386,67 +492,43 @@ int main(int argc, char** argv) {
     };
 
     // Stage 0b: Parallel Links + 16-Byte PackedId64 DSU
+    STAGE_MARK("Stage0b_Links_DSU");
     LinkResolver dsu;
     {
-        auto link_paths = list_csv_files(fs::path(data_dir) / "links");
-        auto link_files = open_mapped_files_parallel(link_paths, num_threads);
-        auto link_chunks = build_csv_chunks(link_files, TUNABLE_ZIPF_CHUNK_BYTES);
-        struct ParsedLink {
-            uint64_t id_a;
-            uint64_t id_b;
-            uint64_t ha;
-            uint64_t hb;
-        };
-        unsigned int l_threads = std::min<unsigned int>(num_threads, std::max<size_t>(1, link_chunks.size()));
-        std::vector<std::vector<ParsedLink>> thread_links(l_threads);
+        CsvFileSet link_files(list_csv_files(fs::path(data_dir) / "links"), TUNABLE_READ_CHUNK_BYTES);
+        unsigned int l_threads = std::min<unsigned int>(num_threads, std::max<size_t>(1, link_files.tasks.size()));
+        std::vector<std::vector<LinkPair>> thread_links(l_threads);
         std::atomic<size_t> next_chunk{0};
         std::vector<std::thread> workers;
         workers.reserve(l_threads);
         for (unsigned int t = 0; t < l_threads; ++t) {
             workers.emplace_back([&, t]() {
                 auto& out_l = thread_links[t];
+                CsvChunkReader reader;
                 while (true) {
                     size_t c_idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                    if (c_idx >= link_chunks.size()) break;
-                    for_each_csv_record_in_slice<2>(link_chunks[c_idx], [&](const std::array<std::string_view, 2>& f) {
+                    if (c_idx >= link_files.tasks.size()) break;
+                    for_each_csv_record_in_slice<2>(reader.read(link_files, c_idx), [&](const std::array<std::string_view, 2>& f) {
                         if (!f[0].empty() && !f[1].empty()) {
-                            uint64_t id_a = pack_id64(f[0]);
-                            uint64_t id_b = pack_id64(f[1]);
-                            out_l.push_back(ParsedLink{
-                                id_a, id_b, hash_id64(id_a), hash_id64(id_b)
-                            });
+                            out_l.push_back(LinkPair{pack_id64(f[0]), pack_id64(f[1])});
                         }
                     });
                 }
             });
         }
         for (auto& w : workers) w.join();
-        link_chunks.clear();
-        link_files.clear();
-
-        size_t total_links = 0;
-        for (const auto& tl : thread_links) total_links += tl.size();
-        dsu.init(total_links);
-        for (const auto& tl : thread_links) {
-            for (const auto& pl : tl) {
-                dsu.add_link_id64(pl.id_a, pl.ha, pl.id_b, pl.hb);
-            }
-        }
-        dsu.finalize(num_threads);
+        dsu.build(thread_links, num_threads);
     }
 
     // Stage 1: Single-Pass Events Ingest with PackedId64
-    auto event_paths = list_csv_files(fs::path(data_dir) / "events");
-    auto event_files = open_mapped_files_parallel(event_paths, num_threads);
-    auto event_chunks = build_csv_chunks(event_files, TUNABLE_ZIPF_CHUNK_BYTES);
+    STAGE_MARK("Stage1_Events_Ingest");
+    CsvFileSet event_files(list_csv_files(fs::path(data_dir) / "events"), TUNABLE_READ_CHUNK_BYTES);
+    size_t est_recs_per_thread_shard = reserve_with_slack(
+        (event_files.total_bytes / TUNABLE_AVG_EVENT_ROW_BYTES) / (num_threads * TUNABLE_NUM_SHARDS));
 
-    size_t total_event_bytes = 0;
-    for (const auto& mf : event_files) total_event_bytes += mf.data_size;
-    size_t est_recs_per_thread_shard =
-        (total_event_bytes / TUNABLE_AVG_EVENT_ROW_BYTES) / (num_threads * TUNABLE_NUM_SHARDS) + 16;
-
-    std::vector<std::vector<std::vector<RawEventRecord>>> thread_ev_shards(
-        num_threads, std::vector<std::vector<RawEventRecord>>(TUNABLE_NUM_SHARDS));
+    std::vector<std::vector<RawEventShard>> thread_ev_shards(
+        num_threads, std::vector<RawEventShard>(TUNABLE_NUM_SHARDS));
+    std::unique_ptr<HugeArena[]> ev_arenas(new HugeArena[num_threads]);
     {
         std::atomic<size_t> next_chunk{0};
         std::vector<std::thread> workers;
@@ -454,12 +536,13 @@ int main(int argc, char** argv) {
         for (unsigned int t = 0; t < num_threads; ++t) {
             workers.emplace_back([&, t]() {
                 auto& my_shards = thread_ev_shards[t];
-                for (auto& s : my_shards) s.reserve(est_recs_per_thread_shard);
+                reserve_shards_in_arena(my_shards, ev_arenas[t], est_recs_per_thread_shard);
+                CsvChunkReader reader;
 
                 while (true) {
                     size_t c_idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                    if (c_idx >= event_chunks.size()) break;
-                    for_each_csv_record_in_slice<7>(event_chunks[c_idx], [&](const std::array<std::string_view, 7>& f) {
+                    if (c_idx >= event_files.tasks.size()) break;
+                    for_each_csv_record_in_slice<7>(reader.read(event_files, c_idx), [&](const std::array<std::string_view, 7>& f) {
                         if (f[0].empty()) return;
 
                         int64_t ingest_ts = 0;
@@ -477,23 +560,21 @@ int main(int argc, char** argv) {
                         }
                         if (valid) {
                             std::string_view etype = f[4];
-                            if (etype == "purchase") {
+                            if (sv_eq4(etype, "view") || sv_eq4(etype, "cart")) {
+                                price = 0;
+                            } else if (sv_eq8(etype, "purchase")) {
                                 if (!parse_price_cents(f[6], price)) {
                                     valid = false;
                                 } else {
                                     cat_idx = lookup_product_cat(f[5]);
                                 }
-                            } else if (etype == "view" || etype == "cart") {
-                                price = 0;
                             } else {
                                 valid = false;
                             }
                         }
 
-                        uint64_t canon_user_id = 0;
-                        if (valid) {
-                            canon_user_id = dsu.resolve_id64(pack_id64(f[1]));
-                        }
+                        // Raw id only; Stage 2 resolves survivors to their person in prefetched batches.
+                        uint64_t raw_user_id = valid ? pack_id64(f[1]) : 0;
 
                         uint64_t ev_id = pack_id64(f[0]);
                         uint64_t ev_hash = hash_id64(ev_id);
@@ -506,7 +587,7 @@ int main(int argc, char** argv) {
 
                         my_shards[shard_id].push_back(RawEventRecord{
                             ev_id,
-                            canon_user_id,
+                            raw_user_id,
                             ingest_rel_sec,
                             rel_ts,
                             packed_meta,
@@ -518,12 +599,12 @@ int main(int argc, char** argv) {
         }
         for (auto& w : workers) w.join();
     }
-    event_chunks.clear();
-    event_files.clear();
 
     // Stage 2: Parallel Deduplication
-    std::vector<std::vector<std::vector<SurvivingEventRecord>>> thread_person_ev_shards(
-        num_threads, std::vector<std::vector<SurvivingEventRecord>>(TUNABLE_NUM_SHARDS));
+    STAGE_MARK("Stage2_Events_Dedup");
+    std::vector<std::vector<SurvivingEventShard>> thread_person_ev_shards(
+        num_threads, std::vector<SurvivingEventShard>(TUNABLE_NUM_SHARDS));
+    std::unique_ptr<HugeArena[]> surv_arenas(new HugeArena[num_threads]);
     {
         std::atomic<size_t> next_shard{0};
         std::vector<std::thread> workers;
@@ -531,14 +612,11 @@ int main(int argc, char** argv) {
         for (unsigned int t = 0; t < num_threads; ++t) {
             workers.emplace_back([&, t]() {
                 auto& my_out = thread_person_ev_shards[t];
-                for (auto& s : my_out) s.reserve(est_recs_per_thread_shard);
+                reserve_shards_in_arena(my_out, surv_arenas[t], est_recs_per_thread_shard);
 
-                struct Slot {
-                    uint64_t event_id;
-                    uint32_t thread_idx;
-                    uint32_t rec_idx;
-                };
-                std::vector<Slot> table;
+                // Packed 8-byte slot: bit 63 = occupied (1), bits 32..62 = 31-bit event_id tag,
+                // bits 24..31 = thread_idx, bits 0..23 = rec_idx. Empty slot = 0ULL.
+                std::vector<uint64_t> table;
 
                 while (true) {
                     size_t s_id = next_shard.fetch_add(1, std::memory_order_relaxed);
@@ -552,49 +630,67 @@ int main(int argc, char** argv) {
 
                     size_t cap = TUNABLE_MIN_HASH_CAP;
                     while (cap < total_recs * 2) cap <<= 1;
-                    table.assign(cap, Slot{0ULL, 0u, 0u});
+                    table.assign(cap, 0ULL);
                     uint64_t mask = cap - 1;
 
                     for (unsigned int rt = 0; rt < num_threads; ++rt) {
                         auto& recs = thread_ev_shards[rt][s_id];
-                        for (uint32_t ri = 0; ri < recs.size(); ++ri) {
+                        const uint32_t n_recs = static_cast<uint32_t>(recs.size());
+                        for (uint32_t ri = 0; ri < n_recs; ++ri) {
+                            // The table is larger than L2: start loading a later record's home slot now.
+                            if (ri + TUNABLE_DEDUP_PREFETCH_DIST < n_recs) {
+                                __builtin_prefetch(&table[recs[ri + TUNABLE_DEDUP_PREFETCH_DIST].ev_hash_hi & mask], 1);
+                            }
                             auto& rec = recs[ri];
                             uint64_t eid = rec.event_id;
+                            uint64_t tag = (1ULL << 63) | (((eid ^ (eid >> 31)) & 0x7FFFFFFFULL) << 32);
                             uint64_t pos = rec.ev_hash_hi & mask;
                             while (true) {
-                                Slot& sl = table[pos];
-                                if (sl.event_id == 0) {
-                                    sl = Slot{eid, rt, ri};
+                                uint64_t sl = table[pos];
+                                if (sl == 0) {
+                                    table[pos] = tag | (static_cast<uint64_t>(rt) << 24) | ri;
                                     break;
                                 }
-                                if (sl.event_id == eid) {
-                                    auto& ex_rec = thread_ev_shards[sl.thread_idx][s_id][sl.rec_idx];
-                                    if (rec.ingest_rel_sec < ex_rec.ingest_rel_sec) {
-                                        ex_rec.price_cat_valid = 0;
-                                        sl = Slot{eid, rt, ri};
-                                    } else {
-                                        rec.price_cat_valid = 0;
+                                if (((sl ^ tag) >> 32) == 0) {
+                                    uint32_t ex_rt = static_cast<uint32_t>((sl >> 24) & 0xFFu);
+                                    uint32_t ex_ri = static_cast<uint32_t>(sl & 0xFFFFFFu);
+                                    auto& ex_rec = thread_ev_shards[ex_rt][s_id][ex_ri];
+                                    if (ex_rec.event_id == eid) {
+                                        if (rec.ingest_rel_sec < ex_rec.ingest_rel_sec) {
+                                            ex_rec.price_cat_valid = 0;
+                                            table[pos] = tag | (static_cast<uint64_t>(rt) << 24) | ri;
+                                        } else {
+                                            rec.price_cat_valid = 0;
+                                        }
+                                        break;
                                     }
-                                    break;
                                 }
                                 pos = (pos + 1) & mask;
                             }
                         }
                     }
 
+                    // Survivors: resolve raw user id -> person, prefetching the resolve-table
+                    // slot TUNABLE_RESOLVE_PREFETCH_DIST records ahead so the misses overlap.
+                    // Dropped records (raw id 0) prefetch a harmless slot; no branch needed.
                     for (unsigned int rt = 0; rt < num_threads; ++rt) {
-                        auto& recs = thread_ev_shards[rt][s_id];
-                        for (const auto& rec : recs) {
+                        const auto& recs = thread_ev_shards[rt][s_id];
+                        const size_t n = recs.size();
+                        for (size_t i = 0; i < n; ++i) {
+                            if (i + TUNABLE_RESOLVE_PREFETCH_DIST < n) {
+                                dsu.prefetch(hash_id64(recs[i + TUNABLE_RESOLVE_PREFETCH_DIST].user_id));
+                            }
+                            const auto& rec = recs[i];
                             if ((rec.price_cat_valid & 0x80000000u) == 0) continue;
-                            size_t p_shard = static_cast<size_t>(hash_id64(rec.user_id) & SHARD_MASK);
+                            uint64_t canon_user_id = dsu.resolve(rec.user_id, hash_id64(rec.user_id));
+                            size_t p_shard = static_cast<size_t>(hash_id64(canon_user_id) & SHARD_MASK);
                             uint64_t packed_ev = (static_cast<uint64_t>(rec.rel_ts) << 32) |
                                                  static_cast<uint64_t>(rec.price_cat_valid & 0x7FFFFFFFu);
                             my_out[p_shard].push_back(SurvivingEventRecord{
-                                rec.user_id,
+                                canon_user_id,
                                 packed_ev
                             });
                         }
-                        std::vector<RawEventRecord>().swap(recs);
                     }
                 }
             });
@@ -603,17 +699,16 @@ int main(int argc, char** argv) {
     }
 
     // Stage 3: Clicks Ingest
-    auto click_paths = list_csv_files(fs::path(data_dir) / "clicks");
-    auto click_files = open_mapped_files_parallel(click_paths, num_threads);
-    auto click_chunks = build_csv_chunks(click_files, TUNABLE_ZIPF_CHUNK_BYTES);
+    STAGE_MARK("Stage3_Clicks_Ingest");
+    CsvFileSet click_files(list_csv_files(fs::path(data_dir) / "clicks"), TUNABLE_READ_CHUNK_BYTES);
+    size_t est_clicks_per_thread_shard = reserve_with_slack(
+        (click_files.total_bytes / TUNABLE_AVG_CLICK_ROW_BYTES) / (num_threads * TUNABLE_NUM_SHARDS));
 
-    size_t total_click_bytes = 0;
-    for (const auto& mf : click_files) total_click_bytes += mf.data_size;
-    size_t est_clicks_per_thread_shard =
-        (total_click_bytes / TUNABLE_AVG_CLICK_ROW_BYTES) / (num_threads * TUNABLE_NUM_SHARDS) + 16;
-
-    std::vector<std::vector<std::vector<ValidClickRecord>>> thread_person_click_shards(
-        num_threads, std::vector<std::vector<ValidClickRecord>>(TUNABLE_NUM_SHARDS));
+    std::vector<std::vector<ValidClickShard>> thread_person_click_shards(
+        num_threads, std::vector<ValidClickShard>(TUNABLE_NUM_SHARDS));
+    // Raw event shards are dead after dedup: their already-faulted arenas hold the clicks.
+    thread_ev_shards.clear();
+    std::unique_ptr<HugeArena[]> click_arenas = std::move(ev_arenas);
     {
         std::atomic<size_t> next_chunk{0};
         std::vector<std::thread> workers;
@@ -621,12 +716,15 @@ int main(int argc, char** argv) {
         for (unsigned int t = 0; t < num_threads; ++t) {
             workers.emplace_back([&, t]() {
                 auto& my_out = thread_person_click_shards[t];
-                for (auto& s : my_out) s.reserve(est_clicks_per_thread_shard);
+                reserve_shards_in_arena(my_out, click_arenas[t], est_clicks_per_thread_shard);
+                CsvChunkReader reader;
+                std::vector<ValidClickRecord> chunk_clicks; // valid clicks of one chunk, raw user ids
 
                 while (true) {
                     size_t c_idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
-                    if (c_idx >= click_chunks.size()) break;
-                    for_each_csv_record_in_slice<4>(click_chunks[c_idx], [&](const std::array<std::string_view, 4>& f) {
+                    if (c_idx >= click_files.tasks.size()) break;
+                    chunk_clicks.clear();
+                    for_each_csv_record_in_slice<4>(reader.read(click_files, c_idx), [&](const std::array<std::string_view, 4>& f) {
                         if (f[0].empty() || f[1].empty() || f[2].empty()) return;
 
                         uint32_t camp_idx = lookup_campaign_idx(f[2]);
@@ -635,25 +733,32 @@ int main(int argc, char** argv) {
                         int64_t ts = 0;
                         if (!parse_timestamp(f[3], ts) || ts < click_window_start || ts >= click_window_end) return;
 
-                        uint64_t canon_user_id = dsu.resolve_id64(pack_id64(f[1]));
-                        size_t p_shard = static_cast<size_t>(hash_id64(canon_user_id) & SHARD_MASK);
-
-                        my_out[p_shard].push_back(ValidClickRecord{
-                            canon_user_id,
+                        chunk_clicks.push_back(ValidClickRecord{
+                            pack_id64(f[1]),
                             pack_id64(f[0]),
                             static_cast<uint32_t>(ts - click_window_start),
                             camp_idx
                         });
                     });
+
+                    // Resolve the chunk's raw user ids with prefetch, then shard by person.
+                    const size_t n = chunk_clicks.size();
+                    for (size_t i = 0; i < n; ++i) {
+                        if (i + TUNABLE_RESOLVE_PREFETCH_DIST < n) {
+                            dsu.prefetch(hash_id64(chunk_clicks[i + TUNABLE_RESOLVE_PREFETCH_DIST].user_id));
+                        }
+                        ValidClickRecord rec = chunk_clicks[i];
+                        rec.user_id = dsu.resolve(rec.user_id, hash_id64(rec.user_id));
+                        my_out[static_cast<size_t>(hash_id64(rec.user_id) & SHARD_MASK)].push_back(rec);
+                    }
                 }
             });
         }
         for (auto& w : workers) w.join();
     }
-    click_chunks.clear();
-    click_files.clear();
 
     // Stage 4: Sessionize & Attribute
+    STAGE_MARK("Stage4_Sessionize_Attrib");
     struct ThreadOutput {
         std::vector<parquet::UserDailyRow> user_rows;
         std::vector<CampaignAgg> camp_grid;
@@ -661,11 +766,27 @@ int main(int argc, char** argv) {
     std::vector<ThreadOutput> thread_outputs(num_threads);
 
     {
+        // Largest shards first (whale persons make a few shards several times bigger),
+        // so no big shard is left to run alone at the end of the stage.
+        std::vector<uint32_t> shard_order(TUNABLE_NUM_SHARDS);
+        {
+            std::vector<size_t> shard_load(TUNABLE_NUM_SHARDS, 0);
+            for (size_t sh = 0; sh < TUNABLE_NUM_SHARDS; ++sh) {
+                shard_order[sh] = static_cast<uint32_t>(sh);
+                for (unsigned int rt = 0; rt < num_threads; ++rt) {
+                    shard_load[sh] += thread_person_ev_shards[rt][sh].size() + thread_person_click_shards[rt][sh].size();
+                }
+            }
+            std::stable_sort(shard_order.begin(), shard_order.end(),
+                             [&](uint32_t a, uint32_t b) { return shard_load[a] > shard_load[b]; });
+        }
         std::atomic<size_t> next_p_shard{0};
         std::vector<std::thread> workers;
         workers.reserve(num_threads);
         size_t num_cats = category_names.size();
         constexpr uint32_t kLookbackMsU32 = static_cast<uint32_t>(TUNABLE_CLICK_LOOKBACK_MS);
+        const int32_t ws_day = static_cast<int32_t>(floor_div_day(window_start));
+        const uint64_t ws_day_off = static_cast<uint64_t>(window_start - static_cast<int64_t>(ws_day) * TUNABLE_DAY_MS);
 
         for (unsigned int t = 0; t < num_threads; ++t) {
             workers.emplace_back([&, t, num_cats]() {
@@ -700,10 +821,12 @@ int main(int argc, char** argv) {
                 std::vector<uint32_t> person_clk_offsets;
                 std::vector<uint32_t> clk_write_pos;
                 std::vector<CompactClick> csr_clicks;
+                std::vector<uint64_t> sort_scratch;
 
                 while (true) {
-                    size_t p_shard = next_p_shard.fetch_add(1, std::memory_order_relaxed);
-                    if (p_shard >= TUNABLE_NUM_SHARDS) break;
+                    size_t order_idx = next_p_shard.fetch_add(1, std::memory_order_relaxed);
+                    if (order_idx >= TUNABLE_NUM_SHARDS) break;
+                    size_t p_shard = shard_order[order_idx];
 
                     size_t total_evs = 0;
                     for (unsigned int rt = 0; rt < num_threads; ++rt) {
@@ -780,7 +903,7 @@ int main(int argc, char** argv) {
                         uint64_t* ev_end = csr_events.data() + person_ev_offsets[p + 1];
                         size_t n_ev = static_cast<size_t>(ev_end - ev_begin);
                         if (n_ev > 1) {
-                            std::sort(ev_begin, ev_end);
+                            sort_events_u64(ev_begin, n_ev, sort_scratch);
                         }
 
                         auto* clk_begin = csr_clicks.data() + person_clk_offsets[p];
@@ -831,8 +954,10 @@ int main(int argc, char** argv) {
                         size_t i = 0;
                         while (i < n_ev) {
                             uint32_t start_rel_ts = static_cast<uint32_t>(ev_begin[i] >> 32);
-                            int64_t session_start = window_start + static_cast<int64_t>(start_rel_ts);
-                            int32_t s_day = static_cast<int32_t>(floor_div_day(session_start));
+                            // floor((window_start + rel) / DAY) with a non-negative unsigned dividend:
+                            // the compiler turns the constant division into a multiply-high.
+                            int32_t s_day = ws_day + static_cast<int32_t>(
+                                (static_cast<uint64_t>(start_rel_ts) + ws_day_off) / static_cast<uint64_t>(TUNABLE_DAY_MS));
                             if (s_day != cur_day) {
                                 flush_user_day();
                                 cur_day = s_day;
@@ -914,6 +1039,7 @@ int main(int argc, char** argv) {
     }
 
     // Stage 5: Parallel Multi-File Parquet Output
+    STAGE_MARK("Stage5_Parquet_Write");
     fs::create_directories(fs::path(out_dir) / "user_daily");
     fs::create_directories(fs::path(out_dir) / "campaign_daily");
 
@@ -981,6 +1107,8 @@ int main(int argc, char** argv) {
         final_camp_rows
     );
 
+    STAGE_MARK("END");
+    STAGE_DUMP();
     std::fflush(nullptr);
     std::_Exit(0);
 }

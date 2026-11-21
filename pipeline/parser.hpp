@@ -2,6 +2,7 @@
 // ============================================================================
 // TUNABLE PARAMETERS (Must remain at the start of the file per AGENTS.md)
 // ============================================================================
+#include <cstddef>
 #include <cstdint>
 
 namespace pipeline {
@@ -9,22 +10,29 @@ constexpr int64_t TUNABLE_MIN_PRICE_CENTS = 1LL;
 constexpr int64_t TUNABLE_MAX_PRICE_CENTS = 10000000LL;
 constexpr int64_t TUNABLE_DAY_MS = 86400000LL;
 constexpr int TUNABLE_CAL_BASE_YEAR = 1970;
-constexpr int TUNABLE_CAL_NUM_YEARS = 200; // Precomputed L1 calendar table for 1970..2169
+constexpr int TUNABLE_CAL_NUM_YEARS = 200;            // Precomputed L1 calendar table for 1970..2169
+constexpr size_t TUNABLE_DATE_CACHE_SLOTS = 64;       // Thread-local direct-mapped YYYY-MM-DD -> epoch-day cache (power of 2)
+constexpr size_t TUNABLE_READ_OVERLAP_BYTES = 64 * 1024; // Extra bytes read past a chunk to find its closing '\n'
+constexpr size_t TUNABLE_READ_PAD_BYTES = 64;         // Readable slack after chunk data (8-byte ID loads, SIMD)
 } // namespace pipeline
 // ============================================================================
 
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#if defined(__AVX2__) || defined(__BMI2__)
+#include <immintrin.h>
+#endif
+
 #ifdef __linux__
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -88,58 +96,102 @@ struct PrecomputedCalendar {
 
 inline constexpr PrecomputedCalendar kCalendar{};
 
-// Branch-collapsed SWAR-style F1 timestamp parser for ingest_ts (YYYY-MM-DDTHH:MM:SSZ)
-inline bool parse_timestamp_f1(std::string_view sv, int64_t& out_ms) {
-    if (sv.size() != 20) return false;
-    const char* s = sv.data();
-    if (((s[10] ^ 'T') | (s[19] ^ 'Z') | (s[4] ^ '-') | (s[7] ^ '-') | (s[13] ^ ':') | (s[16] ^ ':')) != 0) {
-        return false;
-    }
+inline uint64_t load_u64(const char* p) {
+    uint64_t v;
+    std::memcpy(&v, p, 8);
+    return v;
+}
 
-    unsigned int y0 = static_cast<unsigned char>(s[0]) - '0';
-    unsigned int y1 = static_cast<unsigned char>(s[1]) - '0';
-    unsigned int y2 = static_cast<unsigned char>(s[2]) - '0';
-    unsigned int y3 = static_cast<unsigned char>(s[3]) - '0';
-    unsigned int m0 = static_cast<unsigned char>(s[5]) - '0';
-    unsigned int m1 = static_cast<unsigned char>(s[6]) - '0';
-    unsigned int d0 = static_cast<unsigned char>(s[8]) - '0';
-    unsigned int d1 = static_cast<unsigned char>(s[9]) - '0';
-    unsigned int h0 = static_cast<unsigned char>(s[11]) - '0';
-    unsigned int h1 = static_cast<unsigned char>(s[12]) - '0';
-    unsigned int mi0 = static_cast<unsigned char>(s[14]) - '0';
-    unsigned int mi1 = static_cast<unsigned char>(s[15]) - '0';
-    unsigned int s0 = static_cast<unsigned char>(s[17]) - '0';
-    unsigned int s1 = static_cast<unsigned char>(s[18]) - '0';
+// True when all 8 bytes of v are ASCII digits.
+inline bool all_digits8(uint64_t v) {
+    return (((v + 0x4646464646464646ULL) | (v - 0x3030303030303030ULL)) & 0x8080808080808080ULL) == 0;
+}
 
-    if ((y0 > 9) | (y1 > 9) | (y2 > 9) | (y3 > 9) |
-        (m0 > 9) | (m1 > 9) | (d0 > 9) | (d1 > 9) |
-        (h0 > 9) | (h1 > 9) | (mi0 > 9) | (mi1 > 9) |
-        (s0 > 9) | (s1 > 9)) {
-        return false;
-    }
+// Lemire SWAR: 8 ASCII digits (first digit in the lowest byte) -> integer.
+inline uint64_t parse_8digits_swar(uint64_t v) {
+    v -= 0x3030303030303030ULL;
+    v = (v * 10) + (v >> 8);
+    v = (((v & 0x000000FF000000FFULL) * (100 + (1000000ULL << 32))) +
+         (((v >> 16) & 0x000000FF000000FFULL) * (1 + (10000ULL << 32)))) >> 32;
+    return v;
+}
 
-    int year = static_cast<int>(y0 * 1000 + y1 * 100 + y2 * 10 + y3);
-    int month = static_cast<int>(m0 * 10 + m1);
-    int day = static_cast<int>(d0 * 10 + d1);
-    int hour = static_cast<int>(h0 * 10 + h1);
-    int minute = static_cast<int>(mi0 * 10 + mi1);
-    int second = static_cast<int>(s0 * 10 + s1);
-
-    if ((month < 1) | (month > 12) | (day < 1) | (hour > 23) | (minute > 59) | (second > 59)) return false;
-
-    int64_t days;
+// Validated "YYYY-MM-DD" -> days since 1970-01-01 (no cache).
+inline bool parse_date_days_slow(const char* s, int32_t& out_days) {
+    if ((s[4] != '-') | (s[7] != '-')) return false;
+    int year = parse_4digits(s);
+    int month = parse_2digits(s + 5);
+    int day = parse_2digits(s + 8);
+    if ((year | month | day) < 0) return false;
+    if ((month < 1) | (month > 12) | (day < 1)) return false;
     unsigned int y_idx = static_cast<unsigned int>(year - TUNABLE_CAL_BASE_YEAR);
     if (y_idx < static_cast<unsigned int>(TUNABLE_CAL_NUM_YEARS)) {
         if (day > kCalendar.max_dom[y_idx][month]) return false;
-        days = kCalendar.month_epoch_days[y_idx][month] + (day - 1);
+        out_days = kCalendar.month_epoch_days[y_idx][month] + (day - 1);
     } else {
         if (day > max_days_in_month(year, month)) return false;
-        days = days_from_civil(year, month, day);
+        out_days = static_cast<int32_t>(days_from_civil(year, month, day));
     }
-
-    int64_t sec_of_day = static_cast<int64_t>(hour) * 3600 + static_cast<int64_t>(minute) * 60 + second;
-    out_ms = days * TUNABLE_DAY_MS + sec_of_day * 1000LL;
     return true;
+}
+
+// Thread-local direct-mapped cache of validated dates. Zero-initialised (tag 0 = empty),
+// so the thread_local needs no init guard. tag = ("DD" bytes) + 1, never 0 for a stored date.
+struct DateCacheSlot {
+    uint64_t ymd8;   // bytes "YYYY-MM-"
+    uint32_t tag;
+    int32_t days;
+};
+inline thread_local DateCacheSlot tl_date_cache[TUNABLE_DATE_CACHE_SLOTS];
+
+inline bool lookup_date_days(const char* s, int32_t& out_days) {
+    uint64_t ymd8 = load_u64(s);
+    uint16_t dd16;
+    std::memcpy(&dd16, s + 8, 2);
+    uint32_t tag = static_cast<uint32_t>(dd16) + 1u;
+    size_t idx = (static_cast<size_t>(static_cast<unsigned char>(s[8])) * 10u +
+                  static_cast<size_t>(static_cast<unsigned char>(s[9])) +
+                  (static_cast<size_t>(static_cast<unsigned char>(s[6])) << 5)) & (TUNABLE_DATE_CACHE_SLOTS - 1);
+    DateCacheSlot& e = tl_date_cache[idx];
+    if (e.ymd8 == ymd8 && e.tag == tag) {
+        out_days = e.days;
+        return true;
+    }
+    int32_t days;
+    if (!parse_date_days_slow(s, days)) return false;
+    e.ymd8 = ymd8;
+    e.tag = tag;
+    e.days = days;
+    out_days = days;
+    return true;
+}
+
+// "YYYY-MM-DDTHH:MM:SS" core (caller has checked the length, 'T' and the suffix).
+// SWAR HH:MM:SS: one 8-byte load at s+11, colon check, 6-digit check, pairwise combine.
+inline bool parse_iso_core(const char* s, int64_t& out_ms) {
+    int32_t days;
+    if (!lookup_date_days(s, days)) return false;
+    uint64_t v = load_u64(s + 11);
+    if ((v & 0x0000FF0000FF0000ULL) != 0x00003A00003A0000ULL) return false;
+    uint64_t x = v & 0xFFFF00FFFF00FFFFULL;
+    if (((x + 0x4646004646004646ULL) | (x - 0x3030003030003030ULL)) & 0x8080008080008080ULL) return false;
+    uint64_t d = (v - 0x3030003030003030ULL) & 0x0F0F000F0F000F0FULL;
+    uint64_t t = d * 10 + (d >> 8);
+    uint32_t hh = static_cast<uint32_t>(t & 0xFF);
+    uint32_t mm = static_cast<uint32_t>((t >> 24) & 0xFF);
+    uint32_t ss = static_cast<uint32_t>((t >> 48) & 0xFF);
+    if ((hh > 23) | (mm > 59) | (ss > 59)) return false;
+    out_ms = static_cast<int64_t>(days) * TUNABLE_DAY_MS +
+             static_cast<int64_t>(hh * 3600u + mm * 60u + ss) * 1000LL;
+    return true;
+}
+
+// F1 timestamp parser for ingest_ts (YYYY-MM-DDTHH:MM:SSZ)
+inline bool parse_timestamp_f1(std::string_view sv, int64_t& out_ms) {
+    if (sv.size() != 20) return false;
+    const char* s = sv.data();
+    if (((s[10] ^ 'T') | (s[19] ^ 'Z')) != 0) return false;
+    return parse_iso_core(s, out_ms);
 }
 
 inline bool parse_timestamp(std::string_view sv, int64_t& out_ms) {
@@ -148,49 +200,6 @@ inline bool parse_timestamp(std::string_view sv, int64_t& out_ms) {
     size_t len = sv.size();
 
     if ((len == 20 || len == 25) && s[10] == 'T') {
-        if (((s[4] ^ '-') | (s[7] ^ '-') | (s[13] ^ ':') | (s[16] ^ ':')) != 0) return false;
-
-        unsigned int y0 = static_cast<unsigned char>(s[0]) - '0';
-        unsigned int y1 = static_cast<unsigned char>(s[1]) - '0';
-        unsigned int y2 = static_cast<unsigned char>(s[2]) - '0';
-        unsigned int y3 = static_cast<unsigned char>(s[3]) - '0';
-        unsigned int m0 = static_cast<unsigned char>(s[5]) - '0';
-        unsigned int m1 = static_cast<unsigned char>(s[6]) - '0';
-        unsigned int d0 = static_cast<unsigned char>(s[8]) - '0';
-        unsigned int d1 = static_cast<unsigned char>(s[9]) - '0';
-        unsigned int h0 = static_cast<unsigned char>(s[11]) - '0';
-        unsigned int h1 = static_cast<unsigned char>(s[12]) - '0';
-        unsigned int mi0 = static_cast<unsigned char>(s[14]) - '0';
-        unsigned int mi1 = static_cast<unsigned char>(s[15]) - '0';
-        unsigned int s0 = static_cast<unsigned char>(s[17]) - '0';
-        unsigned int s1 = static_cast<unsigned char>(s[18]) - '0';
-
-        if ((y0 > 9) | (y1 > 9) | (y2 > 9) | (y3 > 9) |
-            (m0 > 9) | (m1 > 9) | (d0 > 9) | (d1 > 9) |
-            (h0 > 9) | (h1 > 9) | (mi0 > 9) | (mi1 > 9) |
-            (s0 > 9) | (s1 > 9)) {
-            return false;
-        }
-
-        int year = static_cast<int>(y0 * 1000 + y1 * 100 + y2 * 10 + y3);
-        int month = static_cast<int>(m0 * 10 + m1);
-        int day = static_cast<int>(d0 * 10 + d1);
-        int hour = static_cast<int>(h0 * 10 + h1);
-        int minute = static_cast<int>(mi0 * 10 + mi1);
-        int second = static_cast<int>(s0 * 10 + s1);
-
-        if ((month < 1) | (month > 12) | (day < 1) | (hour > 23) | (minute > 59) | (second > 59)) return false;
-
-        int64_t days;
-        unsigned int y_idx = static_cast<unsigned int>(year - TUNABLE_CAL_BASE_YEAR);
-        if (y_idx < static_cast<unsigned int>(TUNABLE_CAL_NUM_YEARS)) {
-            if (day > kCalendar.max_dom[y_idx][month]) return false;
-            days = kCalendar.month_epoch_days[y_idx][month] + (day - 1);
-        } else {
-            if (day > max_days_in_month(year, month)) return false;
-            days = days_from_civil(year, month, day);
-        }
-
         int64_t offset_minutes = 0;
         if (len == 20) {
             if (s[19] != 'Z') return false;
@@ -204,13 +213,35 @@ inline bool parse_timestamp(std::string_view sv, int64_t& out_ms) {
             offset_minutes = static_cast<int64_t>(off_h) * 60 + off_m;
             if (sign == '-') offset_minutes = -offset_minutes;
         }
-
-        int64_t sec_of_day = static_cast<int64_t>(hour) * 3600 + static_cast<int64_t>(minute) * 60 + second;
-        out_ms = days * TUNABLE_DAY_MS + sec_of_day * 1000LL - offset_minutes * 60000LL;
+        int64_t base_ms;
+        if (!parse_iso_core(s, base_ms)) return false;
+        out_ms = base_ms - offset_minutes * 60000LL;
         return true;
     }
 
-    // Form F3: digits only
+    // Form F3: digits only (epoch milliseconds)
+    if (len == 13) {
+        uint64_t hi8 = load_u64(s);
+        if (!all_digits8(hi8)) return false;
+        uint64_t val = parse_8digits_swar(hi8);
+        for (size_t i = 8; i < 13; ++i) {
+            unsigned int d = static_cast<unsigned int>(static_cast<unsigned char>(s[i]) - '0');
+            if (d > 9) return false;
+            val = val * 10 + d;
+        }
+        out_ms = static_cast<int64_t>(val);
+        return true;
+    }
+    if (len <= 18) { // < 10^18: cannot overflow int64
+        uint64_t val = 0;
+        for (size_t i = 0; i < len; ++i) {
+            unsigned int d = static_cast<unsigned int>(static_cast<unsigned char>(s[i]) - '0');
+            if (d > 9) return false;
+            val = val * 10 + d;
+        }
+        out_ms = static_cast<int64_t>(val);
+        return true;
+    }
     uint64_t val = 0;
     constexpr uint64_t kMax = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
     for (size_t i = 0; i < len; ++i) {
@@ -259,6 +290,35 @@ inline bool try_parse_prefixed_uint(std::string_view sv, const char* prefix, siz
     return true;
 }
 
+// Bitmasks of ',', '\n' and '"' over the 64 bytes at b (bit i = byte b[i]).
+struct CsvMasks64 {
+    uint64_t comma;
+    uint64_t newline;
+    uint64_t quote;
+};
+
+inline CsvMasks64 csv_masks64(const char* b) {
+#ifdef __AVX2__
+    const __m256i v0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
+    const __m256i v1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b + 32));
+    auto mask = [&](char c) -> uint64_t {
+        const __m256i cv = _mm256_set1_epi8(c);
+        uint32_t lo = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, cv)));
+        uint32_t hi = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, cv)));
+        return static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
+    };
+    return CsvMasks64{mask(','), mask('\n'), mask('"')};
+#else
+    CsvMasks64 m{0, 0, 0};
+    for (int i = 0; i < 64; ++i) {
+        m.comma |= static_cast<uint64_t>(b[i] == ',') << i;
+        m.newline |= static_cast<uint64_t>(b[i] == '\n') << i;
+        m.quote |= static_cast<uint64_t>(b[i] == '"') << i;
+    }
+    return m;
+#endif
+}
+
 template <size_t K>
 inline bool parse_csv_line(std::string_view line, std::array<std::string_view, K>& fields) {
     if (line.empty()) return false;
@@ -295,76 +355,74 @@ inline bool parse_csv_line(std::string_view line, std::array<std::string_view, K
     return true;
 }
 
+// Calls cb(fields) for every well-formed record (line) of the slice; malformed and empty
+// lines are skipped. A record is well-formed when it has exactly K fields and each field
+// holds either no '"' or exactly two, one at each end (the quotes are stripped).
+// A last line without '\n' is a record too.
+//
+// One pass over 64-byte blocks: SIMD bitmasks of ',', '\n' and '"'; separators are visited
+// in order with tzcnt, and a field's quote count comes from popcount over the quote mask.
+// Reads only inside the slice (the last partial block is copied to a local buffer).
 template <size_t K, typename Func>
 inline void for_each_csv_record_in_slice(std::string_view slice, Func&& cb) {
-    const char* p = slice.data();
-    const char* end = p + slice.size();
+    static_assert(K >= 2, "a 1-field record could not tell an empty line from an empty field");
+    const char* base = slice.data();
+    const size_t len = slice.size();
     std::array<std::string_view, K> fields;
+    size_t fi = 0;          // index of the field being read (K = too many fields)
+    size_t fstart = 0;      // slice offset of its first byte
+    uint32_t carry_q = 0;   // quotes of the current field seen in earlier blocks
+    bool bad = false;       // the current line is malformed
 
-    while (p < end) {
-        if (*p == '\n') {
-            ++p;
-            continue;
-        }
-        bool ok = true;
-        for (size_t i = 0; i < K; ++i) {
-            if (p < end && *p == '"') {
-                ++p;
-                const char* fstart = p;
-                while (p < end && *p != '"' && *p != ',' && *p != '\n') ++p;
-                if (p == end || *p != '"') {
-                    ok = false;
-                    break;
-                }
-                fields[i] = std::string_view(fstart, static_cast<size_t>(p - fstart));
-                ++p;
-                if (i + 1 < K) {
-                    if (p == end || *p != ',') {
-                        ok = false;
-                        break;
-                    }
-                    ++p;
-                } else {
-                    if (p < end) {
-                        if (*p != '\n') {
-                            ok = false;
-                            break;
-                        }
-                        ++p;
-                    }
-                }
+    // Ends the field [fstart, e) holding q quotes; at_eol: its separator ends the line.
+    auto end_field = [&](size_t e, uint32_t q, bool at_eol) {
+        const char* fs = base + fstart;
+        size_t flen = e - fstart;
+        if (q != 0) {
+            if (q == 2 && flen >= 2 && fs[0] == '"' && fs[flen - 1] == '"') {
+                ++fs;
+                flen -= 2;
             } else {
-                const char* fstart = p;
-                if (i + 1 < K) {
-                    while (p < end && *p != ',' && *p != '\n' && *p != '"') ++p;
-                    if (p == end || *p != ',') {
-                        ok = false;
-                        break;
-                    }
-                    fields[i] = std::string_view(fstart, static_cast<size_t>(p - fstart));
-                    ++p;
-                } else {
-                    while (p < end && *p != '\n' && *p != ',' && *p != '"') ++p;
-                    if (p < end && *p != '\n') {
-                        ok = false;
-                        break;
-                    }
-                    fields[i] = std::string_view(fstart, static_cast<size_t>(p - fstart));
-                    if (p < end) ++p;
-                }
+                bad = true;
             }
         }
-        if (ok) {
-            cb(fields);
-        } else {
-            if (p < end && *p == '\n') {
-                ++p;
-            } else if (p < end) {
-                const char* nl = static_cast<const char*>(std::memchr(p, '\n', static_cast<size_t>(end - p)));
-                p = nl ? (nl + 1) : end;
-            }
+        if (fi < K) fields[fi] = std::string_view(fs, flen);
+        if (at_eol) {
+            if (!bad && fi == K - 1) cb(fields);
+            fi = 0;
+            bad = false;
+        } else if (++fi >= K) {
+            fi = K;
+            bad = true;
         }
+        fstart = e + 1;
+    };
+
+    alignas(32) char tail[64];
+    for (size_t blk = 0; blk < len; blk += 64) {
+        const char* b = base + blk;
+        const size_t rem = len - blk;
+        if (rem < 64) {
+            std::memcpy(tail, b, rem);
+            std::memset(tail + rem, 0, 64 - rem);
+            b = tail;
+        }
+        const CsvMasks64 m = csv_masks64(b);
+        uint64_t seps = m.comma | m.newline;
+        uint64_t counted = 0;   // bits at or below the previous separator in this block
+        while (seps) {
+            const unsigned p = static_cast<unsigned>(__builtin_ctzll(seps));
+            seps &= seps - 1;
+            const uint64_t below = (1ULL << p) - 1;
+            const uint32_t q = carry_q + static_cast<uint32_t>(__builtin_popcountll(m.quote & below & ~counted));
+            carry_q = 0;
+            counted = (below << 1) | 1;
+            end_field(blk + p, q, ((m.newline >> p) & 1) != 0);
+        }
+        carry_q += static_cast<uint32_t>(__builtin_popcountll(m.quote & ~counted));
     }
+    // Last line without a trailing '\n'.
+    if (fstart < len || fi > 0) end_field(len, carry_q, true);
 }
 
 template <typename Func>
@@ -404,127 +462,117 @@ inline std::string read_file_binary(const std::string& path) {
     return buf;
 }
 
-struct MappedFile {
-    const char* data_ptr = nullptr;
-    size_t data_size = 0;
+// A set of CSV files split into fixed-size byte ranges ("tasks") for parallel pread().
+// Each task owns the lines that start inside its range; the header line of each file is skipped.
+struct CsvFileSet {
+    struct Task {
+        uint32_t file;
+        uint64_t off;
+        uint64_t len;
+    };
+    std::vector<std::string> paths;
+    std::vector<uint64_t> sizes;
 #ifdef __linux__
-    int fd = -1;
-#else
-    std::string buf;
+    std::vector<int> fds;
 #endif
+    std::vector<Task> tasks;
+    uint64_t total_bytes = 0;
 
-    MappedFile() = default;
-    MappedFile(const MappedFile&) = delete;
-    MappedFile& operator=(const MappedFile&) = delete;
-
-    MappedFile(MappedFile&& o) noexcept
-        : data_ptr(o.data_ptr), data_size(o.data_size)
+    CsvFileSet(const std::vector<std::string>& file_paths, size_t chunk_bytes) : paths(file_paths) {
+        sizes.resize(paths.size(), 0);
 #ifdef __linux__
-        , fd(o.fd)
-#else
-        , buf(std::move(o.buf))
+        fds.resize(paths.size(), -1);
 #endif
-    {
-        o.data_ptr = nullptr;
-        o.data_size = 0;
+        for (size_t f = 0; f < paths.size(); ++f) {
+            std::error_code ec;
+            uint64_t sz = static_cast<uint64_t>(std::filesystem::file_size(paths[f], ec));
+            if (ec) sz = 0;
 #ifdef __linux__
-        o.fd = -1;
+            if (sz > 0) {
+                fds[f] = ::open(paths[f].c_str(), O_RDONLY);
+                if (fds[f] < 0) sz = 0;
+            }
+#endif
+            sizes[f] = sz;
+            total_bytes += sz;
+            for (uint64_t off = 0; off < sz; off += chunk_bytes) {
+                tasks.push_back(Task{static_cast<uint32_t>(f), off, std::min<uint64_t>(chunk_bytes, sz - off)});
+            }
+        }
+    }
+    CsvFileSet(const CsvFileSet&) = delete;
+    CsvFileSet& operator=(const CsvFileSet&) = delete;
+    ~CsvFileSet() {
+#ifdef __linux__
+        for (int fd : fds) {
+            if (fd >= 0) ::close(fd);
+        }
 #endif
     }
 
-    MappedFile& operator=(MappedFile&& o) noexcept {
-        if (this != &o) {
-            close();
-            data_ptr = o.data_ptr;
-            data_size = o.data_size;
+    // Reads up to n bytes at off into dst; returns the number of bytes read.
+    size_t read_at(uint32_t f, char* dst, size_t n, uint64_t off) const {
 #ifdef __linux__
-            fd = o.fd;
-            o.fd = -1;
+        size_t got = 0;
+        while (got < n) {
+            ssize_t r = ::pread(fds[f], dst + got, n - got, static_cast<off_t>(off + got));
+            if (r <= 0) break;
+            got += static_cast<size_t>(r);
+        }
+        return got;
 #else
-            buf = std::move(o.buf);
+        std::ifstream in(paths[f], std::ios::binary);
+        if (!in) return 0;
+        in.seekg(static_cast<std::streamoff>(off));
+        in.read(dst, static_cast<std::streamsize>(n));
+        return static_cast<size_t>(in.gcount());
 #endif
-            o.data_ptr = nullptr;
-            o.data_size = 0;
-        }
-        return *this;
-    }
-
-    bool open(const std::string& path) {
-#ifdef __linux__
-        fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-        struct stat st;
-        if (::fstat(fd, &st) < 0 || st.st_size <= 0) {
-            ::close(fd);
-            fd = -1;
-            return false;
-        }
-        data_size = static_cast<size_t>(st.st_size);
-        void* p = ::mmap(nullptr, data_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (p == MAP_FAILED) {
-            ::close(fd);
-            fd = -1;
-            data_size = 0;
-            return false;
-        }
-        ::madvise(p, data_size, MADV_SEQUENTIAL);
-        data_ptr = static_cast<const char*>(p);
-        return true;
-#else
-        buf = read_file_binary(path);
-        data_ptr = buf.data();
-        data_size = buf.size();
-        return !buf.empty();
-#endif
-    }
-
-    void close() {
-#ifdef __linux__
-        if (data_ptr && data_size > 0) {
-            ::munmap(const_cast<char*>(data_ptr), data_size);
-        }
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
-        }
-#else
-        std::string().swap(buf);
-#endif
-        data_ptr = nullptr;
-        data_size = 0;
-    }
-
-    ~MappedFile() {
-        close();
-    }
-
-    std::string_view view() const {
-        return std::string_view(data_ptr, data_size);
     }
 };
 
-inline std::vector<std::string_view> build_csv_chunks(const std::vector<MappedFile>& files, size_t chunk_bytes) {
-    std::vector<std::string_view> chunks;
-    for (const auto& mf : files) {
-        std::string_view v = mf.view();
-        if (v.empty()) continue;
-        const char* hdr_nl = static_cast<const char*>(std::memchr(v.data(), '\n', v.size()));
-        if (!hdr_nl) continue;
-        size_t pos = static_cast<size_t>(hdr_nl - v.data()) + 1;
-        size_t sz = v.size();
-        while (pos < sz) {
-            size_t target = pos + chunk_bytes;
-            if (target >= sz) {
-                chunks.emplace_back(v.data() + pos, sz - pos);
-                break;
+// Per-worker reusable buffer that turns a CsvFileSet task into a view of whole lines.
+// The view is followed by at least TUNABLE_READ_PAD_BYTES readable bytes.
+class CsvChunkReader {
+public:
+    std::string_view read(const CsvFileSet& fs, size_t task_idx) {
+        const CsvFileSet::Task& t = fs.tasks[task_idx];
+        const uint64_t size = fs.sizes[t.file];
+        const uint64_t read_off = (t.off == 0) ? 0 : t.off - 1;
+        const uint64_t nominal_end = t.off + t.len;   // exclusive
+        const bool last = nominal_end >= size;
+        uint64_t want = std::min<uint64_t>(size, nominal_end + (last ? 0 : TUNABLE_READ_OVERLAP_BYTES)) - read_off;
+        ensure(want);
+        size_t have = fs.read_at(t.file, buf_.data(), want, read_off);
+
+        // Start: after the first '\n' at abs >= read_off (for off 0 this skips the header).
+        // It must lie before the closing-newline search point, or the chunk owns no line.
+        size_t start_limit = last ? have : std::min<size_t>(have, nominal_end - 1 - read_off);
+        const char* nl0 = static_cast<const char*>(std::memchr(buf_.data(), '\n', start_limit));
+        if (!nl0) return {};
+        size_t start = static_cast<size_t>(nl0 - buf_.data()) + 1;
+        if (last) return std::string_view(buf_.data() + start, have - start);
+
+        // End: after the first '\n' at abs >= nominal_end - 1; read further if needed.
+        size_t search = std::min<size_t>(have, nominal_end - 1 - read_off);
+        while (true) {
+            const char* nl = static_cast<const char*>(std::memchr(buf_.data() + search, '\n', have - search));
+            if (nl) return std::string_view(buf_.data() + start, static_cast<size_t>(nl - buf_.data()) + 1 - start);
+            if (read_off + have >= size || have < want) {
+                return std::string_view(buf_.data() + start, have - start);
             }
-            const char* nl = static_cast<const char*>(std::memchr(v.data() + target, '\n', sz - target));
-            size_t end_pos = nl ? (static_cast<size_t>(nl - v.data()) + 1) : sz;
-            chunks.emplace_back(v.data() + pos, end_pos - pos);
-            pos = end_pos;
+            search = have;
+            uint64_t more = std::min<uint64_t>(size - (read_off + have), TUNABLE_READ_OVERLAP_BYTES);
+            want = have + more;
+            ensure(want);
+            have += fs.read_at(t.file, buf_.data() + have, more, read_off + have);
         }
     }
-    return chunks;
-}
+
+private:
+    void ensure(size_t n) {
+        if (buf_.size() < n + TUNABLE_READ_PAD_BYTES) buf_.resize(n + TUNABLE_READ_PAD_BYTES);
+    }
+    std::vector<char> buf_;
+};
 
 } // namespace pipeline
