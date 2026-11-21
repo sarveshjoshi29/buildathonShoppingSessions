@@ -13,6 +13,7 @@ constexpr bool TUNABLE_ARENA_USE_HUGEPAGES = true;            // madvise(MADV_HU
 #include <cstdint>
 #include <new>
 #include <type_traits>
+#include <utility>
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -109,6 +110,12 @@ struct ArenaAllocator {
         if (arena && arena->owns(p)) return;
         ::operator delete(p);
     }
+    // Default-initialize (no zeroing): ShardWriter resizes shard vectors to capacity and then
+    // writes every element it keeps, so value-initialization would be a wasted pass.
+    template <typename U>
+    void construct(U* p) noexcept { ::new (static_cast<void*>(p)) U; }
+    template <typename U, typename... Args>
+    void construct(U* p, Args&&... args) { ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...); }
     template <typename U>
     bool operator==(const ArenaAllocator<U>& o) const { return arena == o.arena; }
     template <typename U>

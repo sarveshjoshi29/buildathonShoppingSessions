@@ -289,6 +289,50 @@ void reserve_shards_in_arena(std::vector<Shard>& shards, HugeArena& arena, size_
     append_shards_to_arena(shards, arena, per_shard);
 }
 
+// Appends records to one worker's shard vectors through raw pointers kept on the stack, so a
+// push touches no vector header (push_back reloads and stores size per record). On open each
+// vector is resized to its capacity (the arena allocator default-initializes: nothing is
+// written); close() trims it to the records actually written.
+template <typename Shard>
+class ShardWriter {
+public:
+    using T = typename Shard::value_type;
+    explicit ShardWriter(std::vector<Shard>& shards) : shards_(shards) {
+        for (size_t i = 0; i < TUNABLE_NUM_SHARDS; ++i) open(i);
+    }
+    ~ShardWriter() { close(); }
+    ShardWriter(const ShardWriter&) = delete;
+    ShardWriter& operator=(const ShardWriter&) = delete;
+
+    void push(size_t i, const T& rec) {
+        if (cur_[i] == lim_[i]) [[unlikely]] grow(i);
+        *cur_[i]++ = rec;
+    }
+    void close() {
+        if (closed_) return;
+        for (size_t i = 0; i < TUNABLE_NUM_SHARDS; ++i) shards_[i].resize(static_cast<size_t>(cur_[i] - shards_[i].data()));
+        closed_ = true;
+    }
+
+private:
+    void open(size_t i) {
+        Shard& v = shards_[i];
+        const size_t used = v.size();
+        v.resize(v.capacity());
+        cur_[i] = v.data() + used;
+        lim_[i] = v.data() + v.size();
+    }
+    void grow(size_t i) {
+        Shard& v = shards_[i];   // full: size() == capacity() == records written
+        v.reserve(v.size() * 2 + 64);
+        open(i);
+    }
+    std::vector<Shard>& shards_;
+    T* cur_[TUNABLE_NUM_SHARDS];
+    T* lim_[TUNABLE_NUM_SHARDS];
+    bool closed_ = false;
+};
+
 struct CampaignAgg {
     int64_t sessions = 0;
     int64_t purchasing_sessions = 0;
@@ -547,6 +591,7 @@ int main(int argc, char** argv) {
             workers.emplace_back([&, t]() {
                 auto& my_shards = thread_ev_shards[t];
                 reserve_shards_in_arena(my_shards, ev_arenas[t], est_recs_per_thread_shard);
+                ShardWriter<RawEventShard> out(my_shards);
                 CsvChunkReader reader;
 
                 while (true) {
@@ -595,7 +640,7 @@ int main(int argc, char** argv) {
                                                (static_cast<uint32_t>(cat_idx & 0x7Fu) << 24) |
                                                static_cast<uint32_t>(price & 0xFFFFFFu);
 
-                        my_shards[shard_id].push_back(RawEventRecord{
+                        out.push(shard_id, RawEventRecord{
                             ev_id,
                             raw_user_id,
                             ingest_rel_sec,
@@ -623,6 +668,7 @@ int main(int argc, char** argv) {
             workers.emplace_back([&, t]() {
                 auto& my_out = thread_person_ev_shards[t];
                 reserve_shards_in_arena(my_out, surv_arenas[t], est_recs_per_thread_shard);
+                ShardWriter<SurvivingEventShard> out(my_out);
 
                 // Packed 8-byte slot: bit 63 = occupied (1), bits 32..62 = 31-bit event_id tag,
                 // bits 24..31 = thread_idx, bits 0..23 = rec_idx. Empty slot = 0ULL.
@@ -689,7 +735,7 @@ int main(int argc, char** argv) {
                             size_t u_shard = static_cast<size_t>(hash_id64(rec.user_id) & SHARD_MASK);
                             uint64_t packed_ev = (static_cast<uint64_t>(rec.rel_ts) << 32) |
                                                  static_cast<uint64_t>(rec.price_cat_valid & 0x7FFFFFFFu);
-                            my_out[u_shard].push_back(SurvivingEventRecord{
+                            out.push(u_shard, SurvivingEventRecord{
                                 rec.user_id,
                                 packed_ev
                             });
@@ -720,6 +766,7 @@ int main(int argc, char** argv) {
             workers.emplace_back([&, t]() {
                 auto& my_out = thread_person_click_shards[t];
                 reserve_shards_in_arena(my_out, click_arenas[t], est_clicks_per_thread_shard);
+                ShardWriter<ValidClickShard> out(my_out);
                 CsvChunkReader reader;
 
                 while (true) {
@@ -736,7 +783,7 @@ int main(int argc, char** argv) {
 
                         // Sharded by the RAW user id; Stage 3b resolves and forwards.
                         uint64_t raw_user_id = pack_id64(f[1]);
-                        my_out[static_cast<size_t>(hash_id64(raw_user_id) & SHARD_MASK)].push_back(ValidClickRecord{
+                        out.push(static_cast<size_t>(hash_id64(raw_user_id) & SHARD_MASK), ValidClickRecord{
                             raw_user_id,
                             pack_id64(f[0]),
                             static_cast<uint32_t>(ts - click_window_start),
@@ -782,6 +829,8 @@ int main(int argc, char** argv) {
                 // faulted in: forwarding buffers go after the click shards, no new page faults.
                 append_shards_to_arena(fwd_ev, click_arenas[t], est_fwd_ev);
                 append_shards_to_arena(fwd_clk, click_arenas[t], est_fwd_clk);
+                ShardWriter<SurvivingEventShard> fwd_ev_out(fwd_ev);
+                ShardWriter<ValidClickShard> fwd_clk_out(fwd_clk);
 
                 constexpr uint16_t kStay = 0xFFFF;  // dest_of value: id is canonical, record stays
                 PersonIdMap id_map;                 // raw id -> distinct-id index k (this shard only)
@@ -837,7 +886,7 @@ int main(int argc, char** argv) {
                                 v[keep++] = rec;
                             } else {
                                 rec.user_id = canon_of[k];
-                                fwd_ev[d].push_back(rec);
+                                fwd_ev_out.push(d, rec);
                             }
                         }
                         v.resize(keep);
@@ -853,7 +902,7 @@ int main(int argc, char** argv) {
                                 v[keep++] = rec;
                             } else {
                                 rec.user_id = canon_of[k];
-                                fwd_clk[d].push_back(rec);
+                                fwd_clk_out.push(d, rec);
                             }
                         }
                         v.resize(keep);

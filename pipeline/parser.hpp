@@ -166,7 +166,45 @@ inline bool lookup_date_days(const char* s, int32_t& out_days) {
     return true;
 }
 
-// "YYYY-MM-DDTHH:MM:SS" core (caller has checked the length, 'T' and the suffix).
+// "YYYY-MM-DDTHH:MM:SS" core (caller has checked the length (>= 19), 'T' and the suffix).
+#ifdef __AVX2__
+// SSE: "YYYY-MM-DDTHH:MM" in one 16-byte load; digits and separators validated with one mask;
+// digit pairs combined by pmaddubsw. ":SS" is checked separately. No date cache needed.
+inline bool parse_iso_core(const char* s, int64_t& out_ms) {
+    const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s));
+    const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+    const __m128i sep_pos = _mm_setr_epi8(0, 0, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0, -1, 0, 0);
+    const __m128i sep_chr = _mm_setr_epi8(0, 0, 0, 0, '-', 0, 0, '-', 0, 0, 'T', 0, 0, ':', 0, 0);
+    const __m128i is_digit = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+    const __m128i is_sep = _mm_cmpeq_epi8(v, sep_chr);
+    if (_mm_movemask_epi8(_mm_blendv_epi8(is_digit, is_sep, sep_pos)) != 0xFFFF) return false;
+    // u16 lanes: YY(hi) YY(lo) MM DD hh mm
+    const __m128i pairs = _mm_shuffle_epi8(d, _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -1, -1, -1, -1));
+    const __m128i v2 = _mm_maddubs_epi16(pairs, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
+    alignas(16) uint16_t u[8];
+    _mm_store_si128(reinterpret_cast<__m128i*>(u), v2);
+    const unsigned int s0 = static_cast<unsigned int>(static_cast<unsigned char>(s[17])) - '0';
+    const unsigned int s1 = static_cast<unsigned int>(static_cast<unsigned char>(s[18])) - '0';
+    const int year = u[0] * 100 + u[1];
+    const int month = u[2];
+    const int day = u[3];
+    const uint32_t hh = u[4], mm = u[5], ss = s0 * 10 + s1;
+    if ((s[16] != ':') | (s0 > 9) | (s1 > 9) | (month < 1) | (month > 12) | (day < 1) |
+        (hh > 23) | (mm > 59) | (ss > 59)) return false;
+    int32_t days;
+    const unsigned int y_idx = static_cast<unsigned int>(year - TUNABLE_CAL_BASE_YEAR);
+    if (y_idx < static_cast<unsigned int>(TUNABLE_CAL_NUM_YEARS)) {
+        if (day > kCalendar.max_dom[y_idx][month]) return false;
+        days = kCalendar.month_epoch_days[y_idx][month] + (day - 1);
+    } else {
+        if (day > max_days_in_month(year, month)) return false;
+        days = static_cast<int32_t>(days_from_civil(year, month, day));
+    }
+    out_ms = static_cast<int64_t>(days) * TUNABLE_DAY_MS +
+             static_cast<int64_t>(hh * 3600u + mm * 60u + ss) * 1000LL;
+    return true;
+}
+#else
 // SWAR HH:MM:SS: one 8-byte load at s+11, colon check, 6-digit check, pairwise combine.
 inline bool parse_iso_core(const char* s, int64_t& out_ms) {
     int32_t days;
@@ -185,6 +223,7 @@ inline bool parse_iso_core(const char* s, int64_t& out_ms) {
              static_cast<int64_t>(hh * 3600u + mm * 60u + ss) * 1000LL;
     return true;
 }
+#endif
 
 // F1 timestamp parser for ingest_ts (YYYY-MM-DDTHH:MM:SSZ)
 inline bool parse_timestamp_f1(std::string_view sv, int64_t& out_ms) {
@@ -221,6 +260,23 @@ inline bool parse_timestamp(std::string_view sv, int64_t& out_ms) {
 
     // Form F3: digits only (epoch milliseconds)
     if (len == 13) {
+#ifdef __AVX2__
+        // 16-byte load (the 3 bytes past the field are readable: padded chunk buffers / string tails).
+        const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s));
+        const __m128i d = _mm_sub_epi8(v, _mm_set1_epi8('0'));
+        const __m128i is_digit = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+        if ((_mm_movemask_epi8(is_digit) & 0x1FFF) != 0x1FFF) return false;
+        // Right-align the 13 digits in 16 lanes, then 2 -> 4 -> 8 digit combines.
+        __m128i t = _mm_shuffle_epi8(d, _mm_setr_epi8(-1, -1, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12));
+        t = _mm_maddubs_epi16(t, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1));
+        t = _mm_madd_epi16(t, _mm_setr_epi16(100, 1, 100, 1, 100, 1, 100, 1));
+        t = _mm_packus_epi32(t, t);
+        t = _mm_madd_epi16(t, _mm_setr_epi16(10000, 1, 10000, 1, 10000, 1, 10000, 1));
+        const uint64_t hi = static_cast<uint32_t>(_mm_cvtsi128_si32(t));
+        const uint64_t lo = static_cast<uint32_t>(_mm_extract_epi32(t, 1));
+        out_ms = static_cast<int64_t>(hi * 100000000ULL + lo);
+        return true;
+#else
         uint64_t hi8 = load_u64(s);
         if (!all_digits8(hi8)) return false;
         uint64_t val = parse_8digits_swar(hi8);
@@ -231,6 +287,7 @@ inline bool parse_timestamp(std::string_view sv, int64_t& out_ms) {
         }
         out_ms = static_cast<int64_t>(val);
         return true;
+#endif
     }
     if (len <= 18) { // < 10^18: cannot overflow int64
         uint64_t val = 0;
@@ -378,14 +435,16 @@ inline void for_each_csv_record_in_slice(std::string_view slice, Func&& cb) {
     auto end_field = [&](size_t e, uint32_t q, bool at_eol) {
         const char* fs = base + fstart;
         size_t flen = e - fstart;
-        if (q != 0) {
-            if (q == 2 && flen >= 2 && fs[0] == '"' && fs[flen - 1] == '"') {
-                ++fs;
-                flen -= 2;
-            } else {
-                bad = true;
-            }
-        }
+        // Quoting is random per field, so this is branch-free. A quoted field is valid when it
+        // has exactly 2 quotes, one at each end. fs[0] / fs[last] are readable even for an empty
+        // field at the slice end (CsvChunkReader pads its buffers; std::string ends in '\0').
+        // An invalid field marks the line bad, so its (possibly wrapped) length is never used.
+        const bool quoted = q != 0;
+        const size_t last = flen - (flen != 0);
+        const bool ok = !quoted | ((q == 2) & (flen >= 2) & (fs[0] == '"') & (fs[last] == '"'));
+        bad |= !ok;
+        fs += quoted;
+        flen -= 2 * static_cast<size_t>(quoted);
         if (fi < K) fields[fi] = std::string_view(fs, flen);
         if (at_eol) {
             if (!bad && fi == K - 1) cb(fields);
